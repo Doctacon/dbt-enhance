@@ -47,7 +47,10 @@ DbtOption = Annotated[
 TimeoutOption = Annotated[
     float,
     typer.Option(
-        "--timeout", min=0.1, envvar="DBT_ENHANCE_TIMEOUT", help="Local process timeout in seconds."
+        "--timeout",
+        min=0.1,
+        envvar="DBT_ENHANCE_TIMEOUT",
+        help="Query timeout in seconds; the popup reports expiry independently of cleanup.",
     ),
 ]
 

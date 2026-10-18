@@ -5,6 +5,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 
+# Recognized safe progress state; never carry login URLs or tokens to the UI.
+SSO_STATUS = "Browser SSO requested — check your browser"
+SSO_GUIDANCE = (
+    "Snowflake browser SSO needs attention. The popup cannot accept a pasted redirect URL. "
+    "Run dbt debug in a terminal from this project using the same dbt environment, "
+    "target and profiles. Complete SSO and configure approved credential caching, "
+    "then retry; see the README."
+)
+
 
 class EnhanceError(Exception):
     """An actionable error that can be displayed without a Python traceback."""

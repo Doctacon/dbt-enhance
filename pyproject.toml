@@ -1,6 +1,6 @@
 [project]
 name = "dbt-enhance"
-version = "0.1.0"
+version = "0.1.1"
 description = "Run selected dbt SQL from Helix in a beautiful terminal popup"
 readme = "README.md"
 authors = [

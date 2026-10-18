@@ -7,20 +7,24 @@ in a worker thread, while the UI only receives progress and final state updates.
 from __future__ import annotations
 
 import importlib
+import math
 import re
+import time
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import ClassVar
 
 from rich.syntax import Syntax
 from rich.text import Text
-from textual import on, work
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import DataTable, LoadingIndicator, Static
 
-from .models import EnhanceError, QueryRequest, QueryResult, QueryRunner
+from .models import SSO_GUIDANCE, SSO_STATUS, EnhanceError, QueryRequest, QueryResult, QueryRunner
 
 # Keep terminal escapes and other invisible controls out of both Rich and the
 # terminal. Tabs and newlines are intentionally excluded: SQL and errors need
@@ -66,6 +70,24 @@ def _cell_text(value: object, *, cap: int = _CELL_CAP) -> Text:
     if isinstance(value, (int, float)):
         return Text(_clean(value, cap=cap), style="#b8d69b")
     return Text(_clean(value, cap=cap), style="#d8e2e0")
+
+
+class _QueryProgress(Message):
+    def __init__(self, status: str) -> None:
+        super().__init__()
+        self.status = status
+
+
+class _QuerySucceeded(Message):
+    def __init__(self, result: QueryResult) -> None:
+        super().__init__()
+        self.result = result
+
+
+class _QueryFailed(Message):
+    def __init__(self, detail: str) -> None:
+        super().__init__()
+        self.detail = detail
 
 
 def demo_result() -> QueryResult:
@@ -146,6 +168,12 @@ class QueryApp(App[None]):
         self._rows: list[list[object]] = []
         self._sql_open = False
         self._detail_open = False
+        self._terminal = False
+        self._last_status: str | None = None
+        self._query_started_at: float | None = None
+        self._timeout_timer: Timer | None = None
+        self._elapsed_timer: Timer | None = None
+        self._query_thread: Thread | None = None
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -183,7 +211,28 @@ class QueryApp(App[None]):
         else:
             assert self.request is not None
             self._set_context(self.request.file, self.request.target)
-            self._execute_query()
+            self._start_query()
+
+    def _start_query(self) -> None:
+        """Start UI-owned timing before handing the query to a worker."""
+        assert self.request is not None
+        timeout = self.request.timeout
+        if (
+            not isinstance(timeout, bool)
+            and isinstance(timeout, (int, float))
+            and math.isfinite(float(timeout))
+            and timeout > 0
+        ):
+            self._query_started_at = time.monotonic()
+            self._update_pending_meta()
+            refresh_interval = min(0.1, max(float(timeout) / 10, 0.01))
+            self._elapsed_timer = self.set_interval(
+                refresh_interval, self._update_pending_meta, name="query elapsed"
+            )
+            self._timeout_timer = self.set_timer(
+                float(timeout), self._show_timeout, name="query timeout"
+            )
+        self._execute_query()
 
     def _set_context(self, file: Path, target: str | None, project: Path | None = None) -> None:
         """Use popup-sized labels; expose full paths on the context tooltip."""
@@ -199,30 +248,49 @@ class QueryApp(App[None]):
             paths.append(f"project: {_safe_multiline(project)}")
         context.tooltip = Text("\n".join(paths))
 
-    @work(thread=True, exclusive=True)
     def _execute_query(self) -> None:
-        """Run only once, away from Textual's event loop."""
+        """Run the single query on an app-owned daemon thread."""
+        self._query_thread = Thread(
+            target=self._run_query,
+            name="dbt-enhance-query",
+            daemon=True,
+        )
+        self._query_thread.start()
+
+    def _run_query(self) -> None:
+        """Run away from Textual's event loop and deliver only queued messages."""
         assert self.request is not None
 
-        def deliver(callback: object, *args: object) -> None:
-            """Do not keep an unwinding runner alive after its popup closes."""
+        def deliver(message: Message) -> None:
             try:
-                self.call_from_thread(callback, *args)  # type: ignore[arg-type]
+                self.post_message(message)
             except RuntimeError:  # The app may have closed while dbt unwinds.
                 pass
 
-        def progress(message: str) -> None:
-            deliver(self._set_progress, message)
+        def progress(status: str) -> None:
+            deliver(_QueryProgress(status))
 
         try:
             runner = self._runner or self._default_runner()
             query_result = runner(self.request, self._cancel_event, progress)
         except EnhanceError as error:
-            deliver(self._show_error, _safe_multiline(error, cap=_DETAIL_CAP))
+            deliver(_QueryFailed(_safe_multiline(error, cap=_DETAIL_CAP)))
         except Exception as error:  # noqa: BLE001 - errors belong in the popup, not a vanished terminal
-            deliver(self._show_error, _safe_multiline(error, cap=_DETAIL_CAP))
+            deliver(_QueryFailed(_safe_multiline(error, cap=_DETAIL_CAP)))
         else:
-            deliver(self._show_result, query_result)
+            deliver(_QuerySucceeded(query_result))
+
+    @on(_QueryProgress)
+    def _on_query_progress(self, event: _QueryProgress) -> None:
+        self._set_progress(event.status)
+
+    @on(_QuerySucceeded)
+    def _on_query_succeeded(self, event: _QuerySucceeded) -> None:
+        self._show_result(event.result)
+
+    @on(_QueryFailed)
+    def _on_query_failed(self, event: _QueryFailed) -> None:
+        self._show_error(event.detail)
 
     @staticmethod
     def _default_runner() -> QueryRunner:
@@ -231,13 +299,60 @@ class QueryApp(App[None]):
         return module.run_query  # type: ignore[no-any-return]
 
     def _set_progress(self, message: str) -> None:
-        if not self._cancel_event.is_set():
-            self.query_one("#status", Static).update(
-                Text(_clean(message, cap=200) or "Running query…", style="#d7a65a")
-            )
+        if self._terminal:
+            return
+        status = _clean(message, cap=200) or "Running query…"
+        self._last_status = status
+        self.query_one("#status", Static).update(Text(status, style="#d7a65a"))
+
+    def _update_pending_meta(self) -> None:
+        if self._terminal or self._query_started_at is None or self.request is None:
+            return
+        elapsed = time.monotonic() - self._query_started_at
+        timeout = float(self.request.timeout)
+        self.query_one("#result-meta", Static).update(
+            Text(f"{elapsed:.1f}s elapsed  ·  {timeout:g}s timeout", style="#8fd3ca")
+        )
+
+    def _stop_query_timers(self) -> None:
+        for timer in (self._timeout_timer, self._elapsed_timer):
+            if timer is not None:
+                timer.stop()
+        self._timeout_timer = None
+        self._elapsed_timer = None
+
+    def _finish_ui(self) -> bool:
+        """Claim the terminal UI state, rejecting all later worker callbacks."""
+        if self._terminal:
+            return False
+        self._terminal = True
+        self._stop_query_timers()
+        return True
+
+    def _show_timeout(self) -> None:
+        if not self._finish_ui():
+            return
+        assert self.request is not None
+        timeout = float(self.request.timeout)
+        elapsed = (
+            time.monotonic() - self._query_started_at
+            if self._query_started_at is not None
+            else timeout
+        )
+        self.query_one("#spinner").display = False
+        self.query_one("#status", Static).update(Text("Query timed out", style="#d7a65a"))
+        self.query_one("#result-meta", Static).update(
+            Text(f"{elapsed:.1f}s elapsed  ·  {timeout:g}s timeout", style="#8fd3ca")
+        )
+        detail = f"Query failed: dbt query timed out after {timeout:g} seconds."
+        if self._last_status == SSO_STATUS:
+            detail = f"{detail}\n{SSO_GUIDANCE}"
+        self._show_message(detail)
+        # Render the timeout before asking a potentially blocked backend to cancel.
+        self._cancel_event.set()
 
     def _show_result(self, result: QueryResult) -> None:
-        if self._cancel_event.is_set():
+        if not self._finish_ui():
             return
         self._result = result
         self._set_context(
@@ -306,7 +421,7 @@ class QueryApp(App[None]):
         self.query_one("#message-panel", ScrollPanel).display = True
 
     def _show_error(self, detail: str) -> None:
-        if self._cancel_event.is_set():
+        if not self._finish_ui():
             return
         self.query_one("#spinner").display = False
         self.query_one("#status", Static).update(Text("Could not run query", style="#d7a65a"))
@@ -372,8 +487,15 @@ class QueryApp(App[None]):
         self._table_action("scroll_page_down")
 
     def action_quit(self) -> None:
+        self._finish_ui()
         self._cancel_event.set()
         self.exit()
 
     def on_unmount(self) -> None:
+        self._finish_ui()
         self._cancel_event.set()
+        # Give cooperative cleanup time to escalate TERM to KILL before this
+        # short-lived popup process exits. Never wait forever for WSL/OS I/O.
+        # Worker delivery is non-blocking, so joining here cannot deadlock it.
+        if self._query_thread is not None:
+            self._query_thread.join(timeout=2.0)

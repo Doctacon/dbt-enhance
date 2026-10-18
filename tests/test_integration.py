@@ -118,6 +118,61 @@ def test_real_dbt_terminal_semicolon_with_comment_preserves_literals_and_limit(t
     assert "literal;" in result.compiled_sql
 
 
+@pytest.mark.parametrize("inner_limit", [1, 5])
+def test_real_dbt_existing_limit_keeps_both_selection_and_preview_caps(tmp_path, inner_limit):
+    _, profiles, source = _duckdb_project(tmp_path)
+    result = run_query(
+        QueryRequest(
+            sql=f"select range as id from range(10) order by id desc limit {inner_limit}; -- end",
+            file=source,
+            profiles_dir=profiles,
+            dbt=_dbt_executable(),
+            limit=2,
+        )
+    )
+    assert len(result.rows) == min(inner_limit, 2)
+    assert all(row[0] in range(10 - inner_limit, 10) for row in result.rows)
+    assert f"limit {inner_limit}" in result.compiled_sql.lower()
+    assert "limit 2" in result.compiled_sql.lower()
+    assert "dbt_enhance_preview" in result.compiled_sql
+
+
+def test_real_dbt_introspection_works_without_eager_cache_population(tmp_path, monkeypatch):
+    import duckdb
+
+    _, profiles, source = _duckdb_project(tmp_path)
+    monkeypatch.delenv("DBT_POPULATE_CACHE", raising=False)
+    with duckdb.connect(str(tmp_path / "isolated.duckdb")) as connection:
+        connection.execute("create table introspection_values as select 7 as id, 'seven' as label")
+
+    result = run_query(
+        QueryRequest(
+            sql="""
+{% if execute %}
+  {% set relation = adapter.get_relation(database=target.database, schema='main',
+                                         identifier='introspection_values') %}
+  {% if relation is none %}
+    {{ exceptions.raise_compiler_error('Introspection failed on a cold relation cache') }}
+  {% endif %}
+  {% set columns = adapter.get_columns_in_relation(relation) %}
+  select {% for column in columns %}
+    {{ adapter.quote(column.name) }}{% if not loop.last %}, {% endif %}
+  {% endfor %}
+  from {{ relation }}
+{% else %}
+  select 0 as id
+{% endif %}
+""",
+            file=source,
+            profiles_dir=profiles,
+            dbt=_dbt_executable(),
+            limit=2,
+        )
+    )
+    assert result.columns == ["id", "label"]
+    assert result.rows == [[7, "seven"]]
+
+
 def test_real_dbt_empty_preview_and_database_error_are_structured(
     tmp_path: Path,
 ) -> None:

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 from threading import Event
 
 import pytest
 from textual.widgets import DataTable
 
-from dbt_enhance.models import EnhanceError, QueryRequest, QueryResult
+from dbt_enhance import dbt as dbt_backend
+from dbt_enhance.models import SSO_STATUS, EnhanceError, QueryRequest, QueryResult
 from dbt_enhance.ui import QueryApp
 
 
@@ -68,6 +73,8 @@ async def test_runner_error_stays_in_popup_with_readable_lines() -> None:
         assert "�[31mdenied" in message
         assert app.focused is panel
         assert panel.scroll_y > 0
+        assert app._timeout_timer is None
+        assert app._elapsed_timer is None
 
 
 @pytest.mark.asyncio
@@ -188,6 +195,254 @@ async def test_table_scrolls_both_axes_from_keyboard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ui_timeout_survives_blocked_real_runner_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    source = project / "models" / "model.sql"
+    source.parent.mkdir(parents=True)
+    source.write_text("select 1", encoding="utf-8")
+    (project / "dbt_project.yml").write_text("name: timeout_test\n", encoding="utf-8")
+    executable = tmp_path / "fake-dbt"
+    executable.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    cleanup_entered = Event()
+    release_cleanup = Event()
+    original_cleanup = dbt_backend._terminate_process_group
+
+    def blocked_cleanup(process: object) -> None:
+        cleanup_entered.set()
+        release_cleanup.wait(2)
+        original_cleanup(process)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dbt_backend, "_terminate_process_group", blocked_cleanup)
+    request = QueryRequest("select 1", source, dbt=executable, timeout=0.1)
+    app = QueryApp(request, runner=dbt_backend.run_query)
+    started = time.monotonic()
+
+    async with app.run_test() as pilot:
+        try:
+            while "timed out" not in str(app.query_one("#status").renderable).lower():
+                assert time.monotonic() - started < 0.6
+                await pilot.pause(0.01)
+
+            assert cleanup_entered.wait(0.2)
+            assert not app.query_one("#spinner").display
+            assert "timed out" in app.query_one("#message").renderable.plain.lower()
+            assert app._cancel_event.is_set()
+            assert app._timeout_timer is None
+            assert app._elapsed_timer is None
+        finally:
+            release_cleanup.set()
+            await pilot.pause(0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_outcome", ["success", "error"])
+async def test_late_worker_callbacks_cannot_replace_timeout(late_outcome: str) -> None:
+    request = QueryRequest("select 1", Path("model.sql"), timeout=0.05)
+    started = Event()
+    release = Event()
+    finished = Event()
+
+    def late_runner(_: QueryRequest, __: Event, on_status: object) -> QueryResult:
+        started.set()
+        release.wait(2)
+        try:
+            on_status(SSO_STATUS)  # type: ignore[operator]
+            if late_outcome == "error":
+                raise EnhanceError("late backend error")
+            return result()
+        finally:
+            finished.set()
+
+    app = QueryApp(request, runner=late_runner)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        try:
+            assert started.wait(0.2)
+            for _ in range(50):
+                if "timed out" in str(app.query_one("#status").renderable).lower():
+                    break
+                await pilot.pause(0.01)
+            else:
+                pytest.fail("UI watchdog did not display its timeout")
+
+            status = app.query_one("#status").renderable.plain
+            message = app.query_one("#message").renderable.plain
+            release.set()
+            for _ in range(50):
+                if finished.is_set():
+                    break
+                await pilot.pause(0.01)
+            await pilot.pause(0.05)
+
+            assert finished.is_set()
+            assert app.query_one("#status").renderable.plain == status
+            assert app.query_one("#message").renderable.plain == message
+            assert "timed out" in message.lower()
+            assert "late backend error" not in message
+            assert "browser SSO" not in status
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_sso_progress_adds_actionable_guidance_to_timeout() -> None:
+    request = QueryRequest("select 1", Path("model.sql"), timeout=0.05)
+    release = Event()
+
+    def awaiting_sso(_: QueryRequest, __: Event, on_status: object) -> QueryResult:
+        on_status(SSO_STATUS)  # type: ignore[operator]
+        release.wait(2)
+        return result()
+
+    app = QueryApp(request, runner=awaiting_sso)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        try:
+            await pilot.pause(0.1)
+            message = app.query_one("#message").renderable.plain
+            assert "timed out" in message
+            assert "Run dbt debug in a terminal" in message
+            assert "approved credential caching" in message
+        finally:
+            release.set()
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_fast_success_stops_watchdog_without_spurious_timeout() -> None:
+    request = QueryRequest("select 1", Path("model.sql"), timeout=0.05)
+
+    def immediate(*_: object) -> QueryResult:
+        return result()
+
+    app = QueryApp(request, runner=immediate)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        await pilot.pause(0.15)
+        assert app.query_one("#status").renderable.plain == "Complete"
+        assert not app._cancel_event.is_set()
+        assert app._timeout_timer is None
+        assert app._elapsed_timer is None
+
+
+@pytest.mark.asyncio
+async def test_pending_query_shows_elapsed_and_configured_timeout() -> None:
+    request = QueryRequest("select 1", Path("model.sql"), timeout=0.5)
+    release = Event()
+
+    def pending(*_: object) -> QueryResult:
+        release.wait(2)
+        return result()
+
+    app = QueryApp(request, runner=pending)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        try:
+            await pilot.pause(0.15)
+            meta = app.query_one("#result-meta").renderable.plain
+            assert "elapsed" in meta
+            assert "0.5s timeout" in meta
+        finally:
+            release.set()
+            await pilot.pause(0.05)
+
+
+def test_quit_gives_real_dbt_time_to_kill_a_child_ignoring_sigterm(tmp_path) -> None:
+    import os
+    import signal
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "dbt_project.yml").write_text("name: quit_test\n")
+    pid_file = tmp_path / "dbt.pid"
+    executable = tmp_path / "dbt"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, signal, time\nfrom pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    executable.chmod(0o700)
+    program = textwrap.dedent(
+        f"""
+        import asyncio
+        from pathlib import Path
+        from dbt_enhance.models import QueryRequest
+        from dbt_enhance.ui import QueryApp
+
+        async def main():
+            request = QueryRequest('select 1', Path({str(project / "model.sql")!r}),
+                                   dbt=Path({str(executable)!r}), timeout=10)
+            app = QueryApp(request)
+            async with app.run_test() as pilot:
+                for _ in range(200):
+                    if Path({str(pid_file)!r}).exists():
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError('dbt did not start')
+                await pilot.press('q')
+
+        asyncio.run(main())
+        """
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, timeout=5
+        )
+        assert completed.returncode == 0, completed.stderr
+        pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_quit_allows_process_exit_with_noncooperative_runner() -> None:
+    program = textwrap.dedent(
+        """
+        import asyncio
+        from pathlib import Path
+        from threading import Event
+
+        from dbt_enhance.models import QueryRequest
+        from dbt_enhance.ui import QueryApp
+
+        started = Event()
+        held_forever = Event()
+
+        def noncooperative(*args):
+            started.set()
+            held_forever.wait()
+
+        async def main():
+            app = QueryApp(
+                QueryRequest("select 1", Path("model.sql"), timeout=10),
+                runner=noncooperative,
+            )
+            async with app.run_test() as pilot:
+                assert started.wait(0.5)
+                await pilot.press("q")
+
+        asyncio.run(main())
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=4,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.asyncio
 async def test_quit_signals_a_pending_runner() -> None:
     request = QueryRequest("select 1", Path("model.sql"))
     started = Event()
@@ -209,3 +464,5 @@ async def test_quit_signals_a_pending_runner() -> None:
         assert started.is_set()
         await pilot.press("q")
     assert cancelled.wait(0.5)
+    assert app._timeout_timer is None
+    assert app._elapsed_timer is None

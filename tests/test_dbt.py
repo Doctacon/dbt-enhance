@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,25 @@ def option(name):
 record = os.environ.get("FAKE_DBT_RECORD")
 if record:
     Path(record).write_text(json.dumps(args))
+    Path(record + ".env").write_text(json.dumps({{
+        key: os.environ.get(key)
+        for key in (
+            "PYTHONUNBUFFERED", "SNOWFLAKE_DISABLE_PLATFORM_DETECTION",
+            "DBT_CLOUD_TEST_CONTEXT", "DBT_POPULATE_CACHE",
+        )
+    }}))
 sql = option("--inline")
+if "SSO" in sql:
+    print("Initiating login request with your identity provider. "
+          "Press CTRL+C to abort and try again...")
+    print("Going to open: https://login.example.invalid/?token=DO-NOT-DISPLAY to authenticate...")
+    if "EOF" in sql:
+        print("We were unable to open a browser window for you, "
+              "please open the url above manually then paste the "
+              "URL you are redirected to into the terminal.")
+        input("Enter the URL the SSO URL redirected you to: ")
+    # No explicit flush: the backend must request unbuffered Python output.
+    time.sleep(30)
 if "SLEEP" in sql:
     time.sleep(30)
 if "FAIL" in sql:
@@ -166,6 +185,7 @@ def test_run_query_uses_isolated_cli_and_preserves_json_values(
     dbt = _make_fake_dbt(tmp_path)
     record = tmp_path / "arguments.json"
     monkeypatch.setenv("FAKE_DBT_RECORD", str(record))
+    monkeypatch.delenv("DBT_POPULATE_CACHE", raising=False)
     statuses: list[str] = []
 
     result = run_query(
@@ -193,6 +213,12 @@ def test_run_query_uses_isolated_cli_and_preserves_json_values(
 
     args = json.loads(record.read_text())
     assert args[:3] == ["show", "--inline", "select 1"]
+    child_env = json.loads(Path(str(record) + ".env").read_text())
+    assert child_env["DBT_POPULATE_CACHE"] == "false"
+    assert "--no-upload-to-artifacts-ingest-api" in args
+    assert "--no-send-anonymous-usage-stats" in args
+    assert "--write-json" in args
+    assert "--no-version-check" not in args
     assert args[args.index("--project-dir") + 1] == str(project)
     assert args[args.index("--target") + 1] == "qa"
     assert args[args.index("--profiles-dir") + 1] == str(tmp_path / "profiles with spaces")
@@ -200,6 +226,32 @@ def test_run_query_uses_isolated_cli_and_preserves_json_values(
     log_path = Path(args[args.index("--log-path") + 1])
     assert not target_path.exists()
     assert not log_path.exists()
+
+
+@pytest.mark.parametrize("platform_detection", [None, "false", "true"])
+def test_child_environment_preserves_profile_inputs(tmp_path, monkeypatch, platform_detection):
+    _, source = _make_project(tmp_path)
+    record = tmp_path / "arguments.json"
+    monkeypatch.setenv("FAKE_DBT_RECORD", str(record))
+    monkeypatch.setenv("DBT_CLOUD_TEST_CONTEXT", "a-profile-might-use-this")
+    monkeypatch.setenv("PYTHONUNBUFFERED", "0")
+    monkeypatch.setenv("DBT_POPULATE_CACHE", "true")
+    if platform_detection is None:
+        monkeypatch.delenv("SNOWFLAKE_DISABLE_PLATFORM_DETECTION", raising=False)
+    else:
+        monkeypatch.setenv("SNOWFLAKE_DISABLE_PLATFORM_DETECTION", platform_detection)
+
+    run_query(QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path)))
+
+    import os
+
+    child = json.loads(Path(str(record) + ".env").read_text())
+    assert child["PYTHONUNBUFFERED"] == "1"
+    assert child["SNOWFLAKE_DISABLE_PLATFORM_DETECTION"] == (platform_detection or "true")
+    assert child["DBT_CLOUD_TEST_CONTEXT"] == "a-profile-might-use-this"
+    assert child["DBT_POPULATE_CACHE"] == "true"
+    assert os.environ["PYTHONUNBUFFERED"] == "0"
+    assert os.environ.get("SNOWFLAKE_DISABLE_PLATFORM_DETECTION") == platform_detection
 
 
 @pytest.mark.parametrize(
@@ -212,9 +264,18 @@ def test_run_query_uses_isolated_cli_and_preserves_json_values(
         ("select ';'", "select ';'"),
         ("select {{ 6 * 7 }};", "select {{ 6 * 7 }}"),
         ("select $$semicolon;$$;", "select $$semicolon;$$"),
+        ("select 'limit 10' as text", "select 'limit 10' as text"),
+        ("select 1 -- limit 10", "select 1 -- limit 10"),
+        ("select * from (select 1 limit 2)", "select * from (select 1 limit 2)"),
+        ("{% set limit = 10 %}\nselect 1", "{% set limit = 10 %}\nselect 1"),
+        (
+            "select * from {{ ref('values') }} LiMiT {{ var('rows', 10) }}; -- end",
+            "select * from (\nselect * from {{ ref('values') }} "
+            "LiMiT {{ var('rows', 10) }} -- end\n) dbt_enhance_preview",
+        ),
     ],
 )
-def test_preview_strips_only_terminal_delimiter(tmp_path, monkeypatch, sql, expected):
+def test_preview_normalizes_delimiter_and_literal_outer_limit(tmp_path, monkeypatch, sql, expected):
     _, source = _make_project(tmp_path)
     record = tmp_path / "arguments.json"
     monkeypatch.setenv("FAKE_DBT_RECORD", str(record))
@@ -350,6 +411,97 @@ def test_cancellation_returns_quickly(tmp_path: Path) -> None:
     finally:
         timer.cancel()
     assert time.monotonic() - started < 3
+
+
+def test_sso_progress_arrives_before_timeout_without_exposing_login_url(tmp_path: Path) -> None:
+    _, source = _make_project(tmp_path)
+    statuses: list[str] = []
+    cancel = threading.Event()
+
+    def progress(message: str) -> None:
+        statuses.append(message)
+        if "SSO" in message:
+            cancel.set()
+
+    with pytest.raises(EnhanceError, match="cancelled"):
+        run_query(
+            QueryRequest(sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=1),
+            cancel=cancel,
+            on_status=progress,
+        )
+    assert any("SSO" in message for message in statuses)
+    assert all(
+        "DO-NOT-DISPLAY" not in message and "https://" not in message for message in statuses
+    )
+
+
+def test_sso_eof_explains_terminal_login_and_does_not_show_auth_url(tmp_path: Path) -> None:
+    _, source = _make_project(tmp_path)
+    with pytest.raises(EnhanceError) as error:
+        run_query(QueryRequest(sql="SSO EOF", file=source, dbt=_make_fake_dbt(tmp_path)))
+    message = str(error.value)
+    assert "dbt debug" in message
+    assert "terminal" in message
+    assert "SSO" in message
+    assert "DO-NOT-DISPLAY" not in message
+    assert "https://" not in message
+
+
+def test_sso_timeout_includes_login_guidance(tmp_path: Path) -> None:
+    _, source = _make_project(tmp_path)
+    with pytest.raises(EnhanceError) as error:
+        run_query(QueryRequest(sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.5))
+    assert "timed out" in str(error.value)
+    assert "dbt debug" in str(error.value)
+    assert "DO-NOT-DISPLAY" not in str(error.value)
+
+
+def test_timeout_is_not_masked_by_cleanup_permission_error(tmp_path: Path, monkeypatch) -> None:
+    from dbt_enhance import dbt
+
+    _, source = _make_project(tmp_path)
+    signal_group = dbt._signal_group
+    processes = []
+
+    def denied(process, sig):
+        processes.append(process)
+        raise PermissionError("cleanup permission denied")
+
+    monkeypatch.setattr(dbt, "_signal_group", denied)
+    try:
+        with pytest.raises(EnhanceError, match="timed out"):
+            run_query(
+                QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.1)
+            )
+    finally:
+        for process in processes:
+            signal_group(process, dbt.signal.SIGKILL)
+            process.wait(timeout=2)
+
+
+def test_timeout_survives_a_process_that_cannot_be_reaped(tmp_path: Path, monkeypatch) -> None:
+    """Model a stuck WSL child: no cleanup wait may be unbounded or mask timeout."""
+    from dbt_enhance import dbt
+
+    _, source = _make_project(tmp_path)
+    original_wait = subprocess.Popen.wait
+    processes = []
+
+    def stuck_wait(process, timeout=None):
+        processes.append(process)
+        assert timeout is not None, "cleanup attempted an unbounded wait"
+        raise subprocess.TimeoutExpired(process.args, timeout)
+
+    monkeypatch.setattr(dbt.subprocess.Popen, "wait", stuck_wait)
+    try:
+        with pytest.raises(EnhanceError, match="timed out"):
+            run_query(
+                QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.1)
+            )
+    finally:
+        # The real fixture process is killable; reap it outside the simulated OS failure.
+        for process in processes:
+            original_wait(process, timeout=2)
 
 
 def test_timeout_returns_quickly(tmp_path: Path) -> None:
