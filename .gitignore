@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local development and dbt artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+.user.yml
+examples/**/target/
+examples/**/logs/
+examples/**/dbt_packages/
+*.duckdb
+*.duckdb.wal

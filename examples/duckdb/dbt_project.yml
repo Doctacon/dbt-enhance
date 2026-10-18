@@ -1,0 +1,6 @@
+name: dbt_enhance_example
+version: '1.0'
+config-version: 2
+profile: dbt_enhance_example
+model-paths: [models]
+macro-paths: [macros]

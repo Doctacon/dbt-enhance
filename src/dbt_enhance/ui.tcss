@@ -1,0 +1,115 @@
+Screen {
+    background: #101817;
+    color: #d8e2e0;
+}
+
+#shell {
+    height: 100%;
+    padding: 0 1;
+    background: #101817;
+}
+
+#header {
+    height: 1;
+}
+
+#brand {
+    color: #8fd3ca;
+    text-style: bold;
+    width: auto;
+}
+
+#subtitle {
+    color: #7b918e;
+    width: auto;
+    margin-left: 1;
+}
+
+#context {
+    color: #aabbb8;
+    height: 1;
+    overflow: hidden;
+}
+
+#execution {
+    height: 1;
+}
+
+#spinner {
+    width: 3;
+    color: #d7a65a;
+}
+
+#status {
+    color: #d7a65a;
+    width: 1fr;
+}
+
+#result-meta {
+    color: #8fd3ca;
+    width: auto;
+    height: 1;
+}
+
+#warnings-panel,
+#message-panel {
+    height: auto;
+    max-height: 3;
+    overflow-y: auto;
+    color: #d7a65a;
+    border-left: thick #d7a65a;
+    padding-left: 1;
+}
+
+#sql-panel {
+    height: auto;
+    max-height: 6;
+    overflow-y: auto;
+    overflow-x: auto;
+    border: round #31514d;
+    padding: 0 1;
+}
+
+#sql-panel:focus,
+#warnings-panel:focus,
+#message-panel:focus,
+#detail-panel:focus {
+    border: round #8fd3ca;
+}
+
+#results {
+    height: 1fr;
+    min-height: 6;
+    margin-top: 0;
+    background: #142120;
+    color: #d8e2e0;
+    border: round #31514d;
+}
+
+DataTable > .datatable--header {
+    background: #1b302e;
+    color: #8fd3ca;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #27423f;
+    color: #ffffff;
+}
+
+#detail-panel {
+    height: auto;
+    max-height: 3;
+    overflow-y: auto;
+    border: round #31514d;
+    padding: 0 1;
+}
+
+#detail {
+    color: #d8e2e0;
+}
+
+#help {
+    height: 1;
+    color: #718783;
+}

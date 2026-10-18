@@ -1,0 +1,39 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.12'
+          - os: macos-latest
+            python: '3.12'
+          - os: ubuntu-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
+        env:
+          DBT_SEND_ANONYMOUS_USAGE_STATS: 'false'
+      - run: uv build
+      - name: Earlier dbt Core compatibility
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: uv run --with 'dbt-core==1.10.22' --with 'dbt-duckdb==1.9.6' pytest -m integration
+        env:
+          DBT_SEND_ANONYMOUS_USAGE_STATS: 'false'
