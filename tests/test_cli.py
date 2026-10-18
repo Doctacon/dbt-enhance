@@ -19,7 +19,7 @@ def test_help_and_version():
     assert "_view" not in result.stdout
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.1" in result.stdout
+    assert "0.1.2" in result.stdout
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ Helix selection (stdin) + buffer path (quoted heredoc)
   → private JSON handoff → tmux display-popup → Textual QueryApp
   → background worker → discover_project(buffer)
   → project's dbt show --inline ... --output json --log-format json
-  → ShowNode event (rows) + run_results.json (actual executed SQL)
+  → ShowNode event (rows) + ArtifactWritten path → run_results.json (executed SQL)
   → scrollable table + expandable SQL
 ```
 
@@ -42,15 +42,26 @@ the run-results artifact from that same invocation gives the SQL actually used,
 including the row limit. Recompiling separately could disagree or duplicate
 macros with side effects.
 
-**Isolated artifacts rather than a shared manifest cache.** Unique target/log
-directories avoid collisions between open editors or dbt invocations, and do not
-overwrite users' `target/` or `logs/`. The trade-off is fresh parsing per query.
+**Reuse the project's normal parse cache and artifacts.** No target/log path is
+overridden. dbt resolves its project settings and environment overrides, reads
+`partial_parse.msgpack`, validates the cache, and reparses only when needed. This
+replaces the former per-query temporary target directory, which forced a full
+project parse on every selection. Normal project manifests, run results, cache,
+and logs are deliberately updated and retained; there is no separate cache layer.
+
 `ShowNode` does not carry the final executed SQL, so `--no-write-json` would remove
-our reliable source for it. Debug SQL log messages are not used as a replacement.
+our reliable source for it. JSON debug logging supplies `ArtifactWritten` with
+the resolved `run_results.json` path, avoiding our own dbt YAML/Jinja path resolver.
+The preview, write event, and artifact metadata must share an invocation ID; a
+stale or concurrently overwritten artifact is an error, never another query's SQL.
+Debug SQL log messages are not used to reconstruct compiled SQL. Successful output
+is JSON-decoded once for both preview and artifact discovery, within the existing
+output-size limit. Normal dbt commands sharing the target are not serialized.
 
 **Preview-specific connection work.** The child defaults `DBT_POPULATE_CACHE=false`
 without overriding an explicit environment setting. This skips eager schema cache
-loading, not Jinja/ref compilation; standard `get_relation` calls fall back to
+loading, not the project partial-parse cache or Jinja/ref compilation; standard
+`get_relation` calls fall back to
 warehouse introspection on a cache miss. Custom macros may need the opt-in cache.
 Anonymous usage stats and artifact-ingest uploads are explicitly disabled, without
 clearing `DBT_CLOUD_*` inputs a profile might require. `--no-version-check` is not
@@ -116,8 +127,9 @@ parsing bugs. The generated mapping assumes Helix's default POSIX shell.
    inline SQL is parsed as a synthetic `inline_query` SQL operation, not the open
    model. This motivates the documented model-context limitations.
 6. [dbt Core 1.10.22 runnable.py](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/task/runnable.py):
-   run-results are written under `project_target_path` when `write_json` is enabled.
-   Source review alone did not establish CLI path precedence; real tests cover it.
+   run-results are written under `project_target_path` when `write_json` is enabled;
+   `ArtifactWritten` reports their resolved path. Real tests cover project/environment
+   path precedence, artifact invocation IDs, and reuse of the partial-parse cache.
 7. [dbt Core 1.10.22 CLI parameters](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/cli/params.py):
    cache population, artifact-upload opt-out, and the purpose of version checks.
 8. [Snowflake browser authentication](https://github.com/snowflakedb/snowflake-connector-python/blob/main/src/snowflake/connector/auth/webbrowser.py):
@@ -134,8 +146,12 @@ parsing bugs. The generated mapping assumes Helix's default POSIX shell.
 Real isolated DuckDB integration tests run Jinja macros and ephemeral `ref()`,
 check actual compiled SQL and its limit, preserve typed values, and cover empty
 results, database errors, terminal semicolons, trailing comments, existing LIMIT
-clauses with a smaller outer cap, and relation/column introspection on a cold cache. Both Core
-1.10.22 and 1.12.6 have been exercised locally. Test fixtures never use user profiles.
+clauses with a smaller outer cap, and relation/column introspection on a cold cache.
+A repeated 14-column/10,000-row preview checks that a changed SQL selection produces
+fresh rows and compiled SQL while dbt reports `PartialParsingSkipParsing`. Other
+tests cover custom project/env artifact paths and rejection of stale run results.
+Both Core 1.10.22 and 1.12.6 have been exercised locally. Test fixtures never use
+user profiles and clear inherited artifact-path overrides before local testing.
 
 The optional terminal test creates a private tmux server, runs a real Helix
 instance with generated config, selects only one query line from a file containing

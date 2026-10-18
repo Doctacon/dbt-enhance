@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -61,8 +62,10 @@ if "FAIL" in sql:
     print(json.dumps(event))
     sys.exit(2)
 
-target = Path(option("--target-path"))
+target = Path(option("--target-path") if "--target-path" in args
+              else os.environ.get("DBT_TARGET_PATH", "target"))
 unique_id = "sql_operation.fake.inline_query"
+invocation_id = str(uuid.uuid4())
 if "NO_ARTIFACT" not in sql:
     target.mkdir(parents=True, exist_ok=True)
     compiled = "select 1 as id\nlimit " + option("--limit")
@@ -71,9 +74,17 @@ if "NO_ARTIFACT" not in sql:
         "status": "success",
         "compiled_code": compiled,
     }}
+    artifact_id = "previous-invocation" if "STALE_ARTIFACT" in sql else invocation_id
     (target / "run_results.json").write_text(
-        json.dumps({{"results": [result]}})
+        json.dumps({{"metadata": {{"invocation_id": artifact_id}}, "results": [result]}})
     )
+    if "NO_WRITE_EVENT" not in sql:
+        print(json.dumps({{
+            "data": {{"artifact_path": str(target / "run_results.json"),
+                      "artifact_type": "RunExecutionResult"}},
+            "info": {{"name": "ArtifactWritten", "invocation_id": invocation_id,
+                      "level": "debug", "msg": "artifact written"}},
+        }}))
 if "NO_SHOW" not in sql:
     if "EMPTY" in sql:
         rows = []
@@ -85,7 +96,9 @@ if "NO_SHOW" not in sql:
     message = preview if "WIDE" in sql else "preview"
     event = {{
         "data": {{"preview": preview, "unique_id": unique_id}},
-        "info": {{"name": "ShowNode", "level": "info", "msg": message}},
+        "info": {{"name": "ShowNode", "level": "info", "msg": message,
+                  "invocation_id": invocation_id}},
+
     }}
     print(json.dumps(event))
 if "OVERFLOW" in sql:
@@ -178,7 +191,7 @@ def test_find_dbt_invalid_override_is_actionable(tmp_path: Path) -> None:
         find_dbt(tmp_path, tmp_path / "missing")
 
 
-def test_run_query_uses_isolated_cli_and_preserves_json_values(
+def test_run_query_reuses_project_paths_and_preserves_json_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project, source = _make_project(tmp_path, "project with spaces")
@@ -222,10 +235,10 @@ def test_run_query_uses_isolated_cli_and_preserves_json_values(
     assert args[args.index("--project-dir") + 1] == str(project)
     assert args[args.index("--target") + 1] == "qa"
     assert args[args.index("--profiles-dir") + 1] == str(tmp_path / "profiles with spaces")
-    target_path = Path(args[args.index("--target-path") + 1])
-    log_path = Path(args[args.index("--log-path") + 1])
-    assert not target_path.exists()
-    assert not log_path.exists()
+    assert "--target-path" not in args
+    assert "--log-path" not in args
+    assert args[args.index("--log-level") + 1] == "debug"
+    assert (project / "target" / "run_results.json").is_file()
 
 
 @pytest.mark.parametrize("platform_detection", [None, "false", "true"])
@@ -385,7 +398,9 @@ def test_dbt_failure_is_structured_and_actionable(tmp_path: Path) -> None:
     ("sql", "message"),
     [
         ("NO_SHOW", "did not emit a ShowNode"),
-        ("NO_ARTIFACT", "did not write the compiled run_results.json"),
+        ("NO_ARTIFACT", "did not report a run_results.json"),
+        ("NO_WRITE_EVENT", "did not report a run_results.json"),
+        ("STALE_ARTIFACT", "belongs to another invocation"),
     ],
 )
 def test_success_without_required_dbt_output_is_an_error(
@@ -394,6 +409,28 @@ def test_success_without_required_dbt_output_is_an_error(
     _, source = _make_project(tmp_path)
     with pytest.raises(EnhanceError, match=message):
         run_query(QueryRequest(sql=sql, file=source, dbt=_make_fake_dbt(tmp_path)))
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_compiled_sql_uses_reported_custom_artifact_path(tmp_path, monkeypatch, absolute):
+    project, source = _make_project(tmp_path)
+    target = tmp_path / "absolute artifacts" if absolute else Path("custom artifacts")
+    monkeypatch.setenv("DBT_TARGET_PATH", str(target))
+    result = run_query(QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path)))
+    assert result.compiled_sql.endswith("limit 500")
+    assert (project / target / "run_results.json").is_file()
+    assert not (project / "target").exists()
+
+
+def test_missing_artifact_never_reuses_a_previous_query_file(tmp_path):
+    project, source = _make_project(tmp_path)
+    dbt = _make_fake_dbt(tmp_path)
+    run_query(QueryRequest(sql="select 1", file=source, dbt=dbt))
+    artifact = project / "target" / "run_results.json"
+    before = artifact.read_bytes()
+    with pytest.raises(EnhanceError, match="did not report a run_results.json"):
+        run_query(QueryRequest(sql="NO_ARTIFACT", file=source, dbt=dbt))
+    assert artifact.read_bytes() == before
 
 
 def test_cancellation_returns_quickly(tmp_path: Path) -> None:

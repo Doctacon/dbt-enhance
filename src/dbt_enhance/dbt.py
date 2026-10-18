@@ -14,7 +14,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -132,68 +131,62 @@ def run_query(
     _notify(on_status, "Running dbt query")
 
     try:
-        with tempfile.TemporaryDirectory(prefix="dbt-enhance-") as temporary:
-            private_temp = Path(temporary)
-            target_path = private_temp / "target"
-            log_path = private_temp / "logs"
-            target_path.mkdir(mode=0o700)
-            log_path.mkdir(mode=0o700)
+        # Let dbt resolve its normal artifact/cache paths, including project and
+        # environment overrides. This reuses and updates partial_parse.msgpack.
+        command = [
+            str(dbt),
+            "show",
+            "--inline",
+            _preview_sql(request.sql),
+            "--output",
+            "json",
+            "--log-format",
+            "json",
+            "--log-level",
+            "debug",  # ArtifactWritten reports the resolved run_results.json path.
+            "--no-use-colors",
+            "--no-send-anonymous-usage-stats",
+            "--no-upload-to-artifacts-ingest-api",
+            "--write-json",
+            "--limit",
+            str(request.limit),
+            "--project-dir",
+            str(project_dir),
+        ]
+        if request.target is not None:
+            command.extend(("--target", request.target))
+        if request.profiles_dir is not None:
+            command.extend(("--profiles-dir", str(request.profiles_dir)))
 
-            command = [
-                str(dbt),
-                "show",
-                "--inline",
-                _preview_sql(request.sql),
-                "--output",
-                "json",
-                "--log-format",
-                "json",
-                "--no-use-colors",
-                "--no-send-anonymous-usage-stats",
-                "--no-upload-to-artifacts-ingest-api",
-                "--write-json",
-                "--limit",
-                str(request.limit),
-                "--project-dir",
-                str(project_dir),
-                "--target-path",
-                str(target_path),
-                "--log-path",
-                str(log_path),
-            ]
-            if request.target is not None:
-                command.extend(("--target", request.target))
-            if request.profiles_dir is not None:
-                command.extend(("--profiles-dir", str(request.profiles_dir)))
+        return_code, output = _run_process(
+            command,
+            cwd=project_dir,
+            timeout=float(request.timeout),
+            cancel=cancel_event,
+            on_status=on_status,
+        )
+        if return_code != 0:
+            detail = _dbt_error_detail(output)
+            raise EnhanceError(f"dbt query failed with exit code {return_code}: {detail}")
 
-            return_code, output = _run_process(
-                command,
-                cwd=project_dir,
-                timeout=float(request.timeout),
-                cancel=cancel_event,
-                on_status=on_status,
-            )
-            if return_code != 0:
-                detail = _dbt_error_detail(output)
-                raise EnhanceError(f"dbt query failed with exit code {return_code}: {detail}")
+        events = _json_events(output)
+        event = _show_event(events)
+        preview = _parse_preview(event["data"])
+        compiled_sql = _compiled_sql(project_dir, events, event)
+        columns, rows, warnings = _rows_from_preview(preview)
 
-            event = _show_event(output)
-            preview = _parse_preview(event)
-            compiled_sql = _compiled_sql(target_path, event)
-            columns, rows, warnings = _rows_from_preview(preview)
-
-            elapsed = time.monotonic() - started
-            _notify(on_status, f"Query completed in {elapsed:.2f}s")
-            return QueryResult(
-                columns=columns,
-                rows=rows,
-                compiled_sql=compiled_sql,
-                elapsed=elapsed,
-                project_dir=project_dir,
-                limit=request.limit,
-                target=request.target,
-                warnings=warnings,
-            )
+        elapsed = time.monotonic() - started
+        _notify(on_status, f"Query completed in {elapsed:.2f}s")
+        return QueryResult(
+            columns=columns,
+            rows=rows,
+            compiled_sql=compiled_sql,
+            elapsed=elapsed,
+            project_dir=project_dir,
+            limit=request.limit,
+            target=request.target,
+            warnings=warnings,
+        )
     except EnhanceError:
         raise
     except OSError as exc:
@@ -451,13 +444,13 @@ def _json_events(output: str) -> list[dict[str, Any]]:
     return events
 
 
-def _show_event(output: str) -> dict[str, Any]:
-    for event in reversed(_json_events(output)):
+def _show_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+    for event in reversed(events):
         info = event.get("info")
         if isinstance(info, dict) and info.get("name") == "ShowNode":
             data = event.get("data")
             if isinstance(data, dict):
-                return data
+                return event
     raise EnhanceError("dbt exited successfully but did not emit a ShowNode JSON preview event.")
 
 
@@ -474,12 +467,26 @@ def _parse_preview(event: dict[str, Any]) -> list[dict[str, object]]:
     return preview
 
 
-def _compiled_sql(target_path: Path, event: dict[str, Any]) -> str:
-    artifact = target_path / "run_results.json"
-    if not artifact.is_file():
-        raise EnhanceError(
-            "dbt exited successfully but did not write the compiled run_results.json artifact."
-        )
+def _compiled_sql(
+    project_dir: Path, events: list[dict[str, Any]], show_event: dict[str, Any]
+) -> str:
+    invocation_id = show_event["info"].get("invocation_id")
+    if not isinstance(invocation_id, str) or not invocation_id:
+        raise EnhanceError("dbt's ShowNode event is missing its invocation ID.")
+
+    artifact: Path | None = None
+    for event in reversed(events):
+        info, data = event.get("info"), event.get("data")
+        if not isinstance(info, dict) or not isinstance(data, dict):
+            continue
+        if info.get("name") != "ArtifactWritten" or info.get("invocation_id") != invocation_id:
+            continue
+        path = data.get("artifact_path")
+        if isinstance(path, str) and Path(path).name == "run_results.json":
+            artifact = project_dir / path  # Absolute paths remain absolute.
+            break
+    if artifact is None:
+        raise EnhanceError("dbt did not report a run_results.json artifact for this query.")
     try:
         document = json.loads(artifact.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -487,11 +494,17 @@ def _compiled_sql(target_path: Path, event: dict[str, Any]) -> str:
             f"Could not read dbt's compiled run_results.json artifact: {exc}"
         ) from None
 
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("invocation_id") != invocation_id:
+        raise EnhanceError(
+            "dbt's run_results.json belongs to another invocation. A concurrent dbt command "
+            "may have replaced it; retry after that command finishes."
+        )
     results = document.get("results") if isinstance(document, dict) else None
     if not isinstance(results, list):
         raise EnhanceError("dbt's run_results.json artifact has no results list.")
 
-    unique_id = event.get("unique_id")
+    unique_id = show_event["data"].get("unique_id")
     matching = [
         item
         for item in results

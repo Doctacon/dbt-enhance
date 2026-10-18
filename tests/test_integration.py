@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -95,9 +96,90 @@ select 0 as id
     assert "42 as answer" in result.compiled_sql
     assert "limit 3" in result.compiled_sql.lower()
     assert "{{" not in result.compiled_sql
-    assert not (project / "target").exists()
-    assert not (project / "logs").exists()
+    assert (project / "target" / "partial_parse.msgpack").is_file()
+    assert (project / "target" / "run_results.json").is_file()
+    assert (project / "logs" / "dbt.log").is_file()
     assert not (profiles / ".user.yml").exists()
+
+
+def test_real_dbt_reuses_project_partial_parse_cache_for_changed_selection(tmp_path, monkeypatch):
+    from dbt_enhance import dbt as backend
+
+    project, profiles, source = _duckdb_project(tmp_path)
+    # Use a 14-column / 10,000-row preview, with a different unsaved selection
+    # on the second run. Only the project manifest should be reused, never rows/SQL.
+    columns = ", ".join(f"range + {index} as c{index}" for index in range(14))
+    events_per_run = []
+    original = backend._run_process
+    monkeypatch.setenv("DBT_LOG_LEVEL", "debug")
+
+    def capture_events(*args, **kwargs):
+        code, output = original(*args, **kwargs)
+        events_per_run.append(backend._json_events(output))
+        return code, output
+
+    monkeypatch.setattr(backend, "_run_process", capture_events)
+
+    def query(offset):
+        return run_query(
+            QueryRequest(
+                sql=f"select {columns} from range({offset}, {offset + 10000})",
+                file=source,
+                profiles_dir=profiles,
+                dbt=_dbt_executable(),
+                limit=10000,
+            )
+        )
+
+    cold = query(0)
+    cache = project / "target" / "partial_parse.msgpack"
+    assert cache.is_file(), "Preview discarded the project's reusable partial-parse cache"
+    warm = query(10000)
+    assert len(cold.columns) == len(warm.columns) == 14
+    assert len(cold.rows) == len(warm.rows) == 10000
+    assert cold.rows[0][0] == 0
+    assert warm.rows[0][0] == 10000
+    assert cold.compiled_sql != warm.compiled_sql
+    names = {event.get("info", {}).get("name") for event in events_per_run[1]}
+    assert "PartialParsingSkipParsing" in names
+    artifact = json.loads((project / "target" / "run_results.json").read_text())
+    assert artifact["results"][0]["compiled_code"] == warm.compiled_sql
+    print(f"14 columns x 10,000 rows: cold={cold.elapsed:.2f}s; warm={warm.elapsed:.2f}s")
+
+
+@pytest.mark.parametrize("configuration", ["project", "environment"])
+def test_real_dbt_honors_custom_artifact_and_log_paths(tmp_path, monkeypatch, configuration):
+    project, profiles, source = _duckdb_project(tmp_path)
+    if configuration == "project":
+        target = project / "custom target"
+        logs = project / "custom logs"
+        config = project / "dbt_project.yml"
+        config.write_text(
+            config.read_text() + 'target-path: "custom target"\nlog-path: "custom logs"\n'
+        )
+    else:
+        target = tmp_path / "absolute target"
+        logs = tmp_path / "absolute logs"
+        # An explicit environment setting must win over a project-level setting.
+        config = project / "dbt_project.yml"
+        config.write_text(config.read_text() + 'target-path: "unused target"\n')
+        monkeypatch.setenv("DBT_TARGET_PATH", str(target))
+        monkeypatch.setenv("DBT_LOG_PATH", str(logs))
+    result = run_query(
+        QueryRequest(
+            sql="select {{ answer() }} as answer",
+            file=source,
+            profiles_dir=profiles,
+            dbt=_dbt_executable(),
+        )
+    )
+    assert result.rows == [[42]]
+    assert "42 as answer" in result.compiled_sql
+    assert (target / "partial_parse.msgpack").is_file()
+    assert (target / "run_results.json").is_file()
+    assert (logs / "dbt.log").is_file()
+    assert not (project / "target").exists()
+    assert not (project / "unused target").exists()
 
 
 def test_real_dbt_terminal_semicolon_with_comment_preserves_literals_and_limit(tmp_path):

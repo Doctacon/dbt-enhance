@@ -38,7 +38,7 @@ uvx --from 'git+https://github.com/YOUR-ORG/dbt-enhance.git' dbt-enhance setup
 ```
 
 No clone is needed. Setup installs the same Git commit that uvx fetched. You can
-also distribute a built wheel and use `uvx --from /path/to/dbt_enhance-0.1.1-py3-none-any.whl dbt-enhance setup`.
+also distribute a built wheel and use `uvx --from /path/to/dbt_enhance-0.1.2-py3-none-any.whl dbt-enhance setup`.
 
 To update a Git installation, rerun that `uvx` command with `--refresh` after the
 new code is pushed. Setup pins the fetched commit, so upgrading an old pinned tool
@@ -127,10 +127,20 @@ Optional overrides work for both `query` and the shortcut:
 
 For example: `DBT_ENHANCE_TARGET=dev DBT_ENHANCE_LIMIT=1000 hx models/orders.sql`.
 
+Queries use the project's **normal dbt target and log paths**, including
+`target-path`/`log-path` settings and `DBT_TARGET_PATH`/`DBT_LOG_PATH` overrides.
+They reuse and update `partial_parse.msgpack` rather than starting with an empty
+temporary target directory. dbt handles cache validation and reparses changed
+project files when needed; selected SQL is still compiled and executed each time.
+The normal `manifest.json`, `run_results.json`, and logs are updated just as they
+would be by running `dbt show` yourself.
+
 For preview speed, the child defaults `DBT_POPULATE_CACHE=false` (equivalent to
 `--no-populate-cache`), avoiding eager relation discovery across all project schemas.
 Standard adapter introspection still queries on demand. If custom macros rely on
 preloaded cache state, set `DBT_POPULATE_CACHE=true` before launching the editor.
+This is warehouse relation discovery, **not the partial-parse cache**, which is
+reused normally when dbt partial parsing is enabled.
 The child also defaults `SNOWFLAKE_DISABLE_PLATFORM_DETECTION=true` to skip optional
 metadata probes in connector versions supporting that option. Explicit values for
 both variables are preserved; the parent environment is never changed.
@@ -225,9 +235,13 @@ without connecting to a database or reading credentials.
   warehouse scan cost. Closing the popup kills local processes, but warehouse
   cancellation is adapter-dependent; configure server-side statement timeouts.
 - Each execution disables dbt anonymous usage statistics and artifact-ingest uploads,
-  while preserving `DBT_CLOUD_*` and other profile/Jinja environment inputs. Private
-  target/log directories leave your usual artifacts alone. Artifact writing remains
-  enabled to obtain the exact executed SQL; project dbt-version checks remain enabled.
+  while preserving `DBT_CLOUD_*` and other profile/Jinja environment inputs. The
+  project's normal artifacts and logs are updated and retained, including its
+  partial-parse cache. Artifact writing provides the exact executed SQL; project
+  dbt-version checks remain enabled. Avoid overlapping dbt commands writing to the
+  same target: if another invocation replaces the result artifact, the popup reports
+  a conflict rather than showing that invocation's SQL. Normal dbt logs/artifacts
+  can contain selected SQL; keep them out of version control as appropriate.
   This is not a promise of no other network calls by adapters or macros.
   The popup handoff temporarily contains SQL and the
   editor environment in a `0600` file under a `0700` directory; the child consumes
@@ -251,10 +265,12 @@ uvx --from . dbt-enhance setup --force
   to an absolute executable path. Poetry/Conda environments can use this override.
 - **Profile/dependency/Jinja error:** the popup displays dbt's error. Check the
   same project's `dbt debug`, `dbt deps`, and selected SQL using its own dbt environment.
-- **Slow first query:** each preview starts a fresh dbt process, parses the project
-  in isolation, and writes private artifacts for exact executed SQL. Eager relation
-  cache loading is off by default, but startup/parse time remains. A warm SSO token
-  avoids repeated authentication only when credential caching works.
+- **Slow first query:** each preview still starts a fresh dbt process, but subsequent
+  previews can reuse the project's `partial_parse.msgpack`. The first run, a disabled
+  partial parser, changed profiles/variables, or an incompatible cache can require
+  a full parse. Python startup, warehouse execution, fetching rows, and artifact
+  serialization still take time. A warm SSO token avoids repeated authentication
+  only when credential caching works.
 - **SSO or timeout:** follow the Snowflake instructions above. `DBT_ENHANCE_TIMEOUT`
   can override the default; check the timeout displayed in the popup. Local timeout
   or close does not guarantee cancellation of a warehouse query or Windows-owned
