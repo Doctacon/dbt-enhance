@@ -145,14 +145,61 @@ The child also defaults `SNOWFLAKE_DISABLE_PLATFORM_DETECTION=true` to skip opti
 metadata probes in connector versions supporting that option. Explicit values for
 both variables are preserved; the parent environment is never changed.
 
-### Snowflake browser SSO, especially on WSL
+### Snowflake: prefer non-interactive authentication
+
+**Use an organization-approved non-interactive method, such as RSA key-pair
+authentication, for popup queries—especially on WSL.** The popup is not an
+interactive login terminal. Do not rely on completing browser SSO from a WSL
+popup: browser launch reporting, callback routing, and paste-URL fallback can fail.
+If your existing dbt target already uses RSA keys, dbt-enhance uses it unchanged;
+there is no separate connection or authentication configuration for the tool.
+
+For dbt Core, a key-pair target in your existing `profiles.yml` can look like this
+(adapt the profile name and connection settings to your project):
+
+```yaml
+your_profile:  # Matches profile: in dbt_project.yml
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: your-org-your-account
+      user: YOUR_DBT_USER
+      role: YOUR_READ_ONLY_ROLE
+      database: ANALYTICS
+      warehouse: YOUR_WAREHOUSE
+      schema: YOUR_SCHEMA
+      threads: 4
+      private_key_path: "{{ env_var('DBT_SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      # For an encrypted private key; omit this field only if the key is unencrypted.
+      private_key_passphrase: "{{ env_var('DBT_ENV_SECRET_SNOWFLAKE_KEY_PASSPHRASE') }}"
+```
+
+- The corresponding public key must already be registered for that Snowflake user.
+  Follow your organization's key-generation, registration, and rotation policy;
+  see [Snowflake key-pair authentication](https://docs.snowflake.com/en/user-guide/key-pair-auth).
+- Use the existing private key file, preferably encrypted. On WSL, provide an
+  absolute path readable from **inside WSL**, with restrictive file permissions.
+  Never commit private keys or passphrases to the repository.
+- Supply the path and passphrase through your approved environment/secret-manager
+  setup **before launching Helix/Yazi**. The encrypted key must be unlockable without
+  a prompt. dbt's [`DBT_ENV_SECRET_` prefix](https://docs.getdbt.com/reference/dbt-jinja-functions/env_var#secrets)
+  scrubs the passphrase from dbt logs; it is not a substitute for secure storage.
+- Use `private_key_path` / `private_key_passphrase` instead of `password` and remove
+  `authenticator: externalbrowser` from this key-pair target. dbt-enhance does not
+  generate keys, register them, or edit your profiles.
+
+Key-pair auth removes browser interaction and SSO waits. It does **not** remove
+Python/dbt startup, warehouse connection setup, query execution, or result fetching.
+It improves predictability; the timing benefit depends on where your query spends time.
+
+#### Browser SSO fallback (not recommended for WSL popups)
 
 `authenticator: externalbrowser` can work when the browser opens and its callback
-reaches the connector. However, dbt runs with **no interactive stdin**: the popup
-cannot accept the connector's fallback request to paste a redirect URL. On WSL,
-a Windows browser tab opening does not guarantee that launch reporting or the
-callback works. Recognized SSO prompts get a safe status message; login URLs and
-tokens are not forwarded as progress.
+reaches the connector, but dbt runs with **no interactive stdin**: the popup cannot
+accept a pasted redirect URL. If your organization requires browser SSO, complete
+login outside the popup and arrange approved token caching. Recognized SSO prompts
+get a safe status message; login URLs and tokens are not forwarded as progress.
 
 If login fails, expires, or stalls, open a normal terminal **in the same WSL/Linux
 or macOS environment** and use the project's resolved dbt executable:
@@ -265,8 +312,11 @@ uvx --from . dbt-enhance setup --force
   to an absolute executable path. Poetry/Conda environments can use this override.
 - **Profile/dependency/Jinja error:** the popup displays dbt's error. Check the
   same project's `dbt debug`, `dbt deps`, and selected SQL using its own dbt environment.
-- **Slow first query:** each preview still starts a fresh dbt process, but subsequent
-  previews can reuse the project's `partial_parse.msgpack`. The first run, a disabled
+- **Per-query startup:** each preview still starts a fresh dbt process, even when
+  the project's `partial_parse.msgpack` is warm. Non-interactive authentication
+  avoids login interaction, but does not eliminate Python/dbt cold starts. A
+  persistent runner is being evaluated; see the [feasibility study](docs/persistent-dbt-runner.md).
+- **Slow first parse:** subsequent previews can reuse the project's `partial_parse.msgpack`. The first run, a disabled
   partial parser, changed profiles/variables, or an incompatible cache can require
   a full parse. Python startup, warehouse execution, fetching rows, and artifact
   serialization still take time. A warm SSO token avoids repeated authentication
