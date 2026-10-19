@@ -28,6 +28,7 @@ class QueryRequest:
     profiles_dir: Path | None = None
     dbt: Path | None = None
     timeout: float = 120.0
+    backend: str = "process"
 
 
 @dataclass(frozen=True)

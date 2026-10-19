@@ -116,3 +116,31 @@ def test_setup_installs_stable_tool_before_config(tmp_path, monkeypatch):
     assert backup is None
     assert commands[-1] == ["uv", "tool", "install", "--force", "file:///tmp/package"]
     assert str(binary) in config.read_text()
+
+
+def test_worker_backend_is_explicit_and_passed_through_popup(tmp_path, monkeypatch):
+    from dbt_enhance import popup
+
+    captured = []
+    monkeypatch.setattr(popup, "launch_popup", captured.append)
+    args = ["popup", "--file", str(tmp_path / "model.sql")]
+    assert runner.invoke(app, args, input="select 1").exit_code == 0
+    assert captured[-1].backend == "process"
+    monkeypatch.setenv("DBT_ENHANCE_BACKEND", "worker")
+    assert runner.invoke(app, args, input="select 1").exit_code == 0
+    assert captured[-1].backend == "worker"
+    assert runner.invoke(app, [*args, "--backend", "process"], input="select 1").exit_code == 0
+    assert captured[-1].backend == "process"
+    assert runner.invoke(app, [*args, "--backend", "invalid"], input="select 1").exit_code != 0
+
+
+def test_stop_resolves_project_without_starting_a_query(tmp_path, monkeypatch):
+    from dbt_enhance import worker
+
+    (tmp_path / "dbt_project.yml").touch()
+    seen = []
+    monkeypatch.setattr(worker, "stop", lambda project: seen.append(project) or True)
+    result = runner.invoke(app, ["stop", "--file", str(tmp_path / "model.sql")])
+    assert result.exit_code == 0, result.output
+    assert "stopped" in result.stdout
+    assert seen == [tmp_path.resolve()]

@@ -229,6 +229,79 @@ To check timeout behavior, use `dbt-enhance query --file models/example.sql
 --sql 'select 1' --timeout 15`; the popup should show a timeout instead of spinning
 indefinitely, even when authentication has not completed.
 
+## Opt-in warm worker (experimental)
+
+The default `process` backend still runs a fresh dbt command per selection.
+The `worker` backend keeps **both Python/dbt and the adapter's live connection**
+open between queries. It uses dbt's own inline parsing, compilation, and
+adapter-dispatched preview SQL—not a handwritten `ref()`/`source()` resolver.
+
+Enable it before starting Helix/Yazi:
+
+```sh
+export DBT_ENHANCE_BACKEND=worker
+```
+
+Or try it for one terminal query:
+
+```sh
+dbt-enhance query --backend worker --file /absolute/project/models/model.sql \
+  --sql 'select {{ 6 * 7 }} as answer' --json
+```
+
+- The first request still imports dbt and authenticates. Later requests reuse the
+  process and connection, while native partial parsing checks project/model/macro
+  changes and **each selection is freshly compiled and executed**.
+- Compiled SQL comes directly from the native execution result. Worker mode does
+  not need `run_results.json` or JSON manifest writes to display it, and can retain
+  column names for empty results. Normal partial-parse cache, logs, and compiled
+  files still use dbt's ordinary project/environment paths.
+- One worker serves a project at a time, with queries serialized. Changes to the
+  environment, profile, target, project configuration, credential files, or normal
+  virtualenv package metadata restart it. After editing an installed or editable
+  adapter's Python code directly, stop the worker explicitly.
+- An idle worker expires after **10 minutes**. Connection-local state, such as
+  temporary tables, can survive until retirement. Tracked transactions are rolled
+  back between queries; this is not a sandbox for trusted macros or arbitrary
+  session-setting changes.
+- Active-query errors, cancellation, and timeout retire the session. dbt-enhance
+  **never automatically replays** a failed/disconnected query; native adapter and
+  connector retry policies still apply. The next request starts fresh. Cancelling
+  while waiting for another query's lock does not interrupt that query. The popup's
+  independent deadline remains active, and a separate supervisor can terminate
+  the dbt process even if its Python thread is stuck.
+- This private-Core integration admits **Core 1.10.22 and 1.12.6 only**, with the
+  Snowflake/DuckDB adapters. Other releases require the same lifecycle checks before
+  admission. It requires a project Python 3.10+ and an ordinary
+  Python dbt console script; custom shell wrappers, unsupported versions/options,
+  and eager `DBT_POPULATE_CACHE=true` must use `--backend process`. There is no
+  silent fallback that could execute a selection twice.
+- **DuckDB:** a live connection can hold a database-file lock. Stop its worker
+  before running another process that needs to write that database.
+
+Inspect or explicitly retire a project's worker without starting a warehouse query:
+
+```sh
+dbt-enhance doctor --file /absolute/project/models/model.sql
+dbt-enhance stop --file /absolute/project/models/model.sql
+```
+
+`stop` also interrupts an active query. Worker sockets/state are private to your
+OS user; credentials and selections are not placed in worker command arguments.
+The editor environment is inherited by the worker and remains in its memory for
+its lifetime. Project dbt logs/compiled files can still contain selected SQL.
+
+Local DuckDB tests cover both admitted Core versions: retained handle/temporary
+objects, changing models/macros/sources, error recovery, cancellation, rollback,
+and physical connection closure. These are not live Snowflake measurements.
+The default stays `process` until real Snowflake/WSL validation is complete.
+To verify actual Snowflake connection reuse, run `select current_session() as
+session_id` twice through worker mode with the same project/target/environment;
+compare the returned session IDs, not just the Python PID. Check cancellation,
+idle expiry, and credential rotation too. Do not carry diagnostic
+`SNOWFLAKE_AUTH_FORCE_SERVER` overrides into normal timing runs.
+See the [design and measurement notes](docs/persistent-dbt-runner.md).
+
 ## Try it without a warehouse
 
 The UI demo needs neither dbt nor tmux:
@@ -279,22 +352,25 @@ without connecting to a database or reading credentials.
   saved path. Filenames containing newlines are unsupported.
 - **Use trusted projects and a read-only dbt target.** This is not a SQL sandbox:
   dbt macros can execute SQL during compilation. A row limit does not limit
-  warehouse scan cost. Closing the popup kills local processes, but warehouse
-  cancellation is adapter-dependent; configure server-side statement timeouts.
+  warehouse scan cost. Closing a running query requests local cancellation, but
+  warehouse cancellation is adapter-dependent; configure server-side statement
+  timeouts. Closing a completed worker-mode popup leaves its idle session reusable.
 - Each execution disables dbt anonymous usage statistics and artifact-ingest uploads,
   while preserving `DBT_CLOUD_*` and other profile/Jinja environment inputs. The
   project's normal artifacts and logs are updated and retained, including its
-  partial-parse cache. Artifact writing provides the exact executed SQL; project
-  dbt-version checks remain enabled. Avoid overlapping dbt commands writing to the
-  same target: if another invocation replaces the result artifact, the popup reports
-  a conflict rather than showing that invocation's SQL. Normal dbt logs/artifacts
+  partial-parse cache. In process mode, artifact writing provides the exact executed
+  SQL; worker mode reads it directly from the native result. Project dbt-version
+  checks remain enabled. Avoid overlapping dbt commands writing to the same target:
+  in process mode, a replaced result artifact is reported as a conflict rather than
+  showing that invocation's SQL. Normal dbt logs/artifacts
   can contain selected SQL; keep them out of version control as appropriate.
   This is not a promise of no other network calls by adapters or macros.
   The popup handoff temporarily contains SQL and the
   editor environment in a `0600` file under a `0700` directory; the child consumes
   it immediately. Normal exits clean remaining temporary files. Forced crashes
-  can leave private temporary directories. SQL also appears in dbt's process
-  arguments; follow your OS's process-inspection security policy.
+  can leave private temporary directories. SQL also appears in process-backend dbt
+  arguments and when using CLI `--sql`; follow your OS's process-inspection policy.
+  Worker mode sends selections over private IPC instead of dbt command arguments.
 - Selected SQL is limited to 1 MiB (the OS may impose a smaller argument limit).
   dbt output is capped at 16 MiB; lower `--limit` or select fewer columns if exceeded.
   Cell detail previews show up to 8,000 characters; SQL itself is not truncated.
@@ -312,10 +388,10 @@ uvx --from . dbt-enhance setup --force
   to an absolute executable path. Poetry/Conda environments can use this override.
 - **Profile/dependency/Jinja error:** the popup displays dbt's error. Check the
   same project's `dbt debug`, `dbt deps`, and selected SQL using its own dbt environment.
-- **Per-query startup:** each preview still starts a fresh dbt process, even when
-  the project's `partial_parse.msgpack` is warm. Non-interactive authentication
-  avoids login interaction, but does not eliminate Python/dbt cold starts. A
-  persistent runner is being evaluated; see the [feasibility study](docs/persistent-dbt-runner.md).
+- **Per-query startup:** the default process backend starts fresh even with a warm
+  partial-parse cache. Try the [opt-in worker](#opt-in-warm-worker-experimental)
+  to retain imports and a connection. Non-interactive authentication alone does
+  not eliminate Python/dbt cold starts.
 - **Slow first parse:** subsequent previews can reuse the project's `partial_parse.msgpack`. The first run, a disabled
   partial parser, changed profiles/variables, or an incompatible cache can require
   a full parse. Python startup, warehouse execution, fetching rows, and artifact
@@ -328,7 +404,8 @@ uvx --from . dbt-enhance setup --force
 - **Shortcut still missing:** reload Helix; check for a project-local Helix config
   that overrides your user key map.
 
-To remove: delete only the two `space.x` mappings in the config (or restore the
+To remove: stop workers for projects where you enabled them (or allow their idle
+expiry), delete only the two `space.x` mappings in the config (or restore the
 printed backup), then run `uv tool uninstall dbt-enhance`.
 
 ## Development

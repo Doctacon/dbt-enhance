@@ -7,8 +7,11 @@ Helix selection (stdin) + buffer path (quoted heredoc)
   → dbt-enhance popup
   → private JSON handoff → tmux display-popup → Textual QueryApp
   → background worker → discover_project(buffer)
-  → project's dbt show --inline ... --output json --log-format json
-  → ShowNode event (rows) + ArtifactWritten path → run_results.json (executed SQL)
+  → selected backend
+    process (default): project's dbt show --inline ... --output json --log-format json
+      → ShowNode rows + ArtifactWritten path → run_results.json SQL
+    worker (opt-in): authenticated per-project Unix socket → stdlib supervisor
+      → persistent native dbt session in project's Python → native rows + compiled SQL
   → scrollable table + expandable SQL
 ```
 
@@ -16,8 +19,19 @@ Helix selection (stdin) + buffer path (quoted heredoc)
 `EnhanceError`, and `QueryRunner`. Editor transport, dbt execution, and UI can each
 be exercised through that contract without a live editor or warehouse.
 
-- **`dbt.py`** owns discovery, executable resolution, isolated subprocesses,
-  cancellation, bounded output, and dbt protocol parsing. It imports no dbt code.
+- **`dbt.py`** owns discovery, executable resolution, backend dispatch, shared child
+  environment defaults, and the existing isolated-process implementation. It
+  imports no dbt Core code into the tool interpreter.
+- **`worker.py`** owns the opt-in worker client, a project-scoped request lock,
+  private state, context fingerprints, interpreter selection, deadlines, and
+  authenticated status/stop. It never signals a PID read from a state file.
+- **`_worker_helper.py` / `_wire.py`** form a standalone project-Python supervisor
+  with bounded JSON framing. A separate session child keeps dbt and connections
+  warm; the supervisor remains responsive if dbt holds its Python GIL.
+- **`_session.py`** contains the version-gated native dbt integration. It owns one
+  adapter on one thread, refreshes manifests through dbt's partial parser, and
+  invokes native inline setup, compilation, and `ShowRunner.execute`. It is not a
+  replacement Jinja/ref resolver and never runs dbt concurrently in one process.
 - **`popup.py`** owns the private handoff and real terminal lifecycle. The child
   runs via the same Python executable as the parent. Credentials are not passed
   through tmux `-e` command arguments.
@@ -33,8 +47,10 @@ be exercised through that contract without a live editor or warehouse.
 ## Why these decisions
 
 **External dbt, not a bundled adapter.** Users can keep incompatible adapters and
-Python versions in separate projects. Using the project's public CLI also avoids
-embedding dbt's process-global state in the UI.
+Python versions in separate projects. The default public-CLI backend avoids
+embedding dbt's process-global state in the UI. The worker uses private Core
+interfaces only inside its separate project-interpreter child; unsupported setups
+keep the explicit process backend rather than silently skipping native behavior.
 
 **One dbt execution, not compile-then-show.** dbt's `show` runner applies the
 adapter's `get_show_sql` macro to compiled SQL, then executes that string. Reading
@@ -54,9 +70,44 @@ our reliable source for it. JSON debug logging supplies `ArtifactWritten` with
 the resolved `run_results.json` path, avoiding our own dbt YAML/Jinja path resolver.
 The preview, write event, and artifact metadata must share an invocation ID; a
 stale or concurrently overwritten artifact is an error, never another query's SQL.
-Debug SQL log messages are not used to reconstruct compiled SQL. Successful output
-is JSON-decoded once for both preview and artifact discovery, within the existing
-output-size limit. Normal dbt commands sharing the target are not serialized.
+Debug SQL log messages are not used to reconstruct compiled SQL. Successful process
+output is JSON-decoded once for both preview and artifact discovery, within the
+existing output-size limit. Worker mode instead reads the native execution
+result's final `compiled_code` and Agate table, so it can disable JSON artifact
+writes without losing compiled SQL or empty-result column names. Neither backend
+redirects dbt to private artifact directories. Ordinary external dbt commands
+sharing the target are not serialized.
+
+**Opt-in worker lifetime.** The process backend remains the default. Worker mode
+requires a recognizable Python dbt console script; its absolute shebang interpreter
+is used without resolving away a virtualenv symlink. A stdlib-only helper runs
+under that interpreter and starts a separate native-session child. dbt-enhance
+need not be installed in the project's environment. The helper removes its own
+package directory from the native import path so `dbt_enhance/dbt.py` cannot
+shadow the project's actual `dbt` package. Successful requests retain that child
+and its connection for up to ten idle minutes. Native compilation uses
+fresh request flags/invocation state and a freshly validated native manifest, not
+cached query results. Relation-cache state is cleared; tracked transactions are
+rolled back between requests. Connection-local temporary objects/settings can
+persist, which is an intentional semantic difference from fresh CLI invocations.
+
+The UI's runner interface is unchanged. A per-project advisory lock serializes
+requests and is deadline/cancellation-aware. An opaque keyed project slot under a
+private runtime directory contains a random authentication token and generation
+fingerprint, not raw environment values. Configuration/environment/package changes
+retire the old worker before replacement. Native preflight reports the resolved
+profile path before reading it (including `.env` resolution); credential paths
+follow after configuration. First-read fingerprints are retained across both
+callbacks. Credential-file changes are watched;
+manual edits to imported Python source require an explicit stop. Sockets and state
+files are private to the OS user, and SQL is carried over bounded JSON frames.
+
+The supervisor, not dbt's execution thread, enforces the accepted request timeout
+and observes client disconnects. Any query failure, cancellation, malformed
+execution transport, or uncertain disconnect retires the session; there is no
+automatic query replay. Stop uses authenticated IPC, not a PID file. Graceful
+native cleanup is bounded by process termination. The separate UI timer remains
+necessary, and local cleanup still cannot guarantee remote warehouse cancellation.
 
 **Preview-specific connection work.** The child defaults `DBT_POPULATE_CACHE=false`
 without overriding an explicit environment setting. This skips eager schema cache
@@ -143,6 +194,13 @@ parsing bugs. The generated mapping assumes Helix's default POSIX shell.
 
 ## Validation and limits
 
+`tests/test_session.py` proves native compilation/freshness, retained handles and
+temporary tables, rollback, error retirement, and physical teardown on both
+admitted Core versions. The worker/helper suites cover private IPC, frozen-child
+deadlines, context/credential invalidation, no replay, and real DuckDB worker
+queries. An installed-wheel smoke also crosses a dbt-free Python 3.12 UI environment
+and a separate Python 3.10 project environment with no dbt-enhance installation.
+
 Real isolated DuckDB integration tests run Jinja macros and ephemeral `ref()`,
 check actual compiled SQL and its limit, preserve typed values, and cover empty
 results, database errors, terminal semicolons, trailing comments, existing LIMIT
@@ -158,8 +216,9 @@ instance with generated config, selects only one query line from a file containi
 invalid unselected SQL, opens the real popup, expands SQL, and checks the original
 file remains unchanged. It requires Helix/tmux on the test machine.
 
-Empty Agate JSON previews are `[]`, so there is no column metadata to display.
-The UI states this explicitly rather than guessing a schema. The dbt event and
+In process mode, empty Agate JSON previews are `[]`, so column metadata is lost;
+the UI states this explicitly rather than guessing a schema. Worker mode reads
+column names directly from the native Agate table even when its rows are empty. The dbt event and
 artifact formats are validated; missing or incompatible output is an error, not
 an invented success. This protocol targets dbt Core, not Fusion or the Cloud CLI.
 
@@ -172,8 +231,14 @@ leader has exited; regression tests preserve permission failures elsewhere.
 Regression fixtures also model unreapable processes, cleanup permission errors,
 hidden/EOF SSO prompts, late worker callbacks, and closing with a non-cooperative
 runner. A real local child ignoring SIGTERM must be killed before the popup exits.
-These reproduce repository failure modes, **not** a live Snowflake/WSL SSO session;
-the exact remotely reported hang remains an environment-specific hypothesis.
+Those local fixtures do not themselves establish Snowflake/WSL behavior. The user
+subsequently verified installed commit `53f15e` on WSL with an empty SSO token cache
+and a forced browser callback wait: the UI showed a ticking 120-second deadline,
+then timeout at 120.0 seconds with SSO guidance; the dbt child was gone at the next
+sample. The original five-minute hang occurred on `e28e588` and is considered fixed
+by v0.1.1. This evidence validates the existing process backend, not the new
+worker's Snowflake connection lifetime or cancellation, which require separate
+remote validation before changing the default.
 Cancellation cannot guarantee remote warehouse cancellation. Neither dbt compilation nor `show` is a read-only
 security boundary; trusted macros and least-privilege warehouse credentials are
 still required.

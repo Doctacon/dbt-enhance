@@ -1,7 +1,9 @@
 # Persistent dbt process and connection reuse
 
-Status: feasibility research, **not an implemented runtime feature**. The shipped
-runner still starts dbt for each query. The offline probe below is not a daemon.
+Status: an **experimental opt-in worker is implemented in this checkout**;
+`process` remains the default. Native lifecycle tests pass on Core **1.10.22** and
+**1.12.6** with local DuckDB. No live Snowflake/WSL worker validation or release is
+claimed. The original process-only experiment below remains separate evidence.
 
 ## Recommendation
 
@@ -15,8 +17,8 @@ These are separate optimizations:
 | Retained state | Avoided work | Current status |
 | --- | --- | --- |
 | `partial_parse.msgpack` | Full project parsing when the cache is valid | Implemented |
-| Python process and imports | Python/dbt/adapter module cold starts | Locally demonstrated; not shipped |
-| Warehouse connection/session | Repeated connection and authentication setup | Not implemented or benchmarked |
+| Python process and imports | Python/dbt/adapter module cold starts | Implemented in opt-in worker |
+| Warehouse connection/session | Repeated connection and authentication setup | DuckDB retention verified; Snowflake not yet verified |
 | Query results | Re-execution of selected SQL | Not proposed; each selection must execute freshly |
 
 A loop around `dbtRunner.invoke()` demonstrates the second row, **not the third**.
@@ -72,7 +74,90 @@ uv run python docs/benchmarks/dbt_process_reuse.py
 uv run --with 'dbt-core==1.10.22' python docs/benchmarks/dbt_process_reuse.py
 ```
 
-## What dbt supports, and what remains to design
+## Native retained-session implementation and validation
+
+`_session.py` owns a native configuration/adapter lifecycle on one OS thread.
+Each request refreshes native invocation state and uses
+`ManifestLoader.get_full_manifest(config, reset=True)`, inline task initialization,
+`ShowRunner.compile`, and `ShowRunner.execute`. The connection context explicitly
+retains the handle. It does **not** loop over `dbtRunner.invoke`, inject a stale
+manifest, suppress global cleanup, or implement its own Jinja/ref resolver.
+Compiled SQL and typed rows come from the native result; empty-result column names
+are retained without writing JSON result/manifest artifacts. Normal partial-parse
+cache and log paths remain authoritative.
+
+Support is deliberately gated to **exact Core 1.10.22 and 1.12.6**, not a speculative
+minor-version range or constructor-signature check. The regression matrix proves,
+for both versions with dbt-duckdb 1.9.6:
+
+- Native compilation/execution, changed selections, edited models/macros/sources,
+  fresh invocation IDs/times, preview limits, and empty-result columns.
+- The identical retained adapter handle and a surviving connection-local temporary
+  table, including a series of repeated requests.
+- SQL/output failures retire the session; a fresh session recovers without keeping
+  the failed session's temporary objects. No failed query is replayed.
+- Tracked transactions roll back, explicit close is idempotent, the native
+  connection is marked closed, and **another process can open the same writable
+  DuckDB database after close**. Checking only an empty adapter registry was not
+  sufficient: dbt-duckdb defaults to `keep_open=True`, so retirement also closes
+  its owned root environment connection and clears that environment.
+- End-to-end worker timeout/error recovery, changed 14-column/10,000-row previews,
+  native numeric/date values, and fresh compiled SQL.
+
+A separate stdlib supervisor enforces request deadlines and client-disconnect
+cleanup independently of dbt's thread/GIL. Tests freeze the child with `SIGSTOP`
+and send a large request, proving stop and timeout still work when the child cannot
+read. Native IPC writes must remain nonblocking. Other offline tests cover private
+socket/state permissions, authenticated control, SSO URL redaction, credential
+rotation through symlinks, bounded file checks, context invalidation (including a
+profile directory resolved inside dbt through `.env`), and no replay after an
+uncertain execution.
+
+The installed wheel was also exercised from a **dbt-free Python 3.12 tool
+environment** against a separate **Python 3.10.20 project environment containing
+dbt Core 1.12.6 but no dbt-enhance**. Native queries and the retained temporary
+table passed, as did explicit stop followed by reopening the database from another
+process. This verifies the packaged helpers, not just source-tree imports.
+
+On Linux, parent-death signaling protects the session if the supervisor dies.
+macOS uses a watchdog thread; abrupt supervisor death combined with a native
+extension indefinitely holding the session GIL remains a limitation of that
+fallback. Normal stop/timeout is handled by the separate supervisor on both OSes.
+Local process death still does not establish remote warehouse cancellation.
+
+## Transport-inclusive worker benchmark
+
+The [worker benchmark](benchmarks/dbt_worker.py) uses the public `run_query`
+backend seam, including worker startup, authenticated IPC, result decoding, and
+compiled-SQL delivery. It compares identical changing selections against the
+existing process backend, using a minimal disposable DuckDB project and the
+normal warm partial-parse cache. The worker's temporary-table check proves a
+retained connection, not merely reuse of its Python PID.
+
+macOS arm64, Python 3.12.7, dbt-duckdb 1.9.6; three samples per workload,
+medians:
+
+| Core | Workload | Process backend | Warm worker |
+| --- | --- | ---: | ---: |
+| 1.12.6 | One row | 2.677s | 0.032s |
+| 1.12.6 | 14 columns × 10,000 rows | 3.161s | 0.440s |
+| 1.10.22 | One row | 2.310s | 0.030s |
+| 1.10.22 | 14 columns × 10,000 rows | 2.804s | 0.435s |
+
+The first worker request, with an already-warm disk cache, took **2.398s** /
+**2.116s** respectively. Startup/authentication is amortized, not eliminated.
+These totals exclude tool/TUI startup and rendering and are **not** predictions
+for a large project, Snowflake network/authentication, or WSL. Unlike the earlier
+experiment, worker mode avoids JSON result/manifest writes because it has the
+native compiled result directly; this comparison measures the complete backend
+change, not the isolated contribution of any one optimization.
+
+```sh
+uv run python docs/benchmarks/dbt_worker.py
+uv run --with 'dbt-core==1.10.22' python docs/benchmarks/dbt_worker.py
+```
+
+## dbt lifecycle constraints
 
 - `dbtRunner.invoke()` provides a Python entry point with CLI-style arguments.
   Multiple **concurrent** invocations in one process are unsupported in the
@@ -92,43 +177,45 @@ uv run --with 'dbt-core==1.10.22' python docs/benchmarks/dbt_process_reuse.py
   process's environment. A worker needs explicit environment/configuration
   invalidation, not just another invocation. [5]
 
-To retain an actual connection, the next experiment must investigate an owned,
-long-lived dbt adapter/runtime lifecycle, or dbt compilation followed by execution
-on an owned connection. Neither has been validated here. Simply suppressing
-cleanup globally is not a sound implementation: it risks stale configuration,
-leaked resources, and incorrect credentials or targets. Direct connector execution
-also has to preserve adapter SQL semantics, Jinja/ref behavior, preview limits,
-result types, and error handling rather than become a Snowflake-only shortcut. [6]
+The implementation therefore owns the adapter/runtime lifecycle rather than
+suppressing cleanup globally or replacing execution with a Snowflake-only shortcut.
+Adapter-specific SQL handling remains native. Real Snowflake retained-session,
+credential-rotation, and cancellation behavior still need validation. [6]
 
-## Proposed implementation shape
+## Worker boundaries
 
-Keep the current `QueryRunner` interface: request, cancellation event, progress
-callback, and `QueryResult`. A persistent adapter at that seam should own:
+The current `QueryRunner` interface is preserved: request, cancellation event,
+progress callback, and `QueryResult`. The opt-in implementation owns:
 
 1. **A lazily started project-local process.** Use the interpreter/environment of
    the resolved dbt executable, not the uv tool's environment. Custom executable
-   wrappers need explicit support or a clear fallback to the existing CLI runner.
+   wrappers receive a clear instruction to select the existing process backend;
+   there is no automatic fallback after SQL may have executed.
    Workers continue using normal project target/log paths, not isolated artifacts.
 2. **One active query per worker.** Serialize requests, with bounded waiting or an
    explicit busy response. Never let different requests mutate dbt globals in
    parallel. Separate project/profile/target/credential contexts must not share a
    live connection accidentally.
 3. **An owned connection lifecycle.** Retain a healthy session for an idle period
-   (for example, ten minutes), close it on expiry, and reconnect when necessary.
-   Do not silently retry a query after an uncertain disconnect: it may already
-   have executed, and trusted dbt macros can have side effects.
+   (ten minutes), close it on expiry, and start fresh when necessary.
+   dbt-enhance never retries a query after an uncertain disconnect: it may already
+   have executed, and trusted dbt macros can have side effects. Native adapter or
+   connector retry policies still apply.
 4. **Restartable cancellation and failures.** Preserve the independent UI deadline.
    Terminate/recycle a wedged worker rather than attempting unsafe Python-thread
    interruption. Treat cleanup failures as grounds to replace the worker. Local
    process termination still does not guarantee warehouse cancellation.
 5. **Fresh configuration and bounded resources.** Restart on relevant environment,
    profile, `.env`, interpreter, or adapter changes. Revalidate project state using
-   dbt's normal parsing rules. Retain the row/output limits, artifact invocation-ID
-   checks, safe diagnostics, and idle shutdown.
+   dbt's normal parsing rules. Retain row/output limits, safe diagnostics, and idle
+   shutdown. Process mode retains artifact invocation-ID checks; worker mode reads
+   compiled SQL directly from its native execution result. Direct manual edits to
+   installed adapter Python source require an explicit worker stop.
 6. **Private local transport.** Restrict socket/directory permissions and verify
    worker ownership. Do not put credentials in process arguments, logs, or public
-   worker identifiers. Define client-disconnect, stale-socket, and crash recovery
-   behavior before making the worker the default.
+   worker identifiers. Client disconnects during active work retire the session;
+   stale sockets/crashes can be replaced before a new execution is sent. A failure
+   after sending SQL is never automatically retried.
 
 Acceptance should include real Snowflake RSA-auth tests on WSL: separate timings
 for worker startup, compilation, connection/authentication, execution/fetch, and UI

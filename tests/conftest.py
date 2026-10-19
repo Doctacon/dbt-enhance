@@ -10,5 +10,6 @@ def isolated_dbt_paths(monkeypatch):
         "DBT_LOG_PATH",
         "DBT_PARTIAL_PARSE",
         "DBT_PARTIAL_PARSE_FILE_PATH",
+        "DBT_ENHANCE_BACKEND",
     ):
         monkeypatch.delenv(name, raising=False)

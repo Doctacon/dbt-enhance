@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 from dataclasses import asdict
+from enum import StrEnum
 from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated
@@ -55,6 +56,21 @@ TimeoutOption = Annotated[
 ]
 
 
+class Backend(StrEnum):
+    process = "process"
+    worker = "worker"
+
+
+BackendOption = Annotated[
+    Backend,
+    typer.Option(
+        "--backend",
+        envvar="DBT_ENHANCE_BACKEND",
+        help="process: one dbt invocation per query; worker: opt-in persistent dbt/session.",
+    ),
+]
+
+
 def _request(
     file: Path,
     sql: str | None,
@@ -63,6 +79,7 @@ def _request(
     profiles_dir: Path | None,
     dbt: Path | None,
     timeout: float,
+    backend: str = "process",
 ) -> QueryRequest:
     if str(file) == "[scratch]":
         raise EnhanceError(
@@ -88,6 +105,7 @@ def _request(
         profiles_dir=profiles_dir.expanduser().absolute() if profiles_dir else None,
         dbt=dbt.expanduser().absolute() if dbt else None,
         timeout=timeout,
+        backend=backend,
     )
 
 
@@ -119,12 +137,13 @@ def popup(
     profiles_dir: ProfilesOption = None,
     dbt: DbtOption = None,
     timeout: TimeoutOption = 120.0,
+    backend: BackendOption = Backend.process,
 ) -> None:
     """Receive a selection on stdin and open a tmux popup (used by Helix)."""
     from dbt_enhance.popup import launch_popup
 
     try:
-        launch_popup(_request(file, None, limit, target, profiles_dir, dbt, timeout))
+        launch_popup(_request(file, None, limit, target, profiles_dir, dbt, timeout, backend.value))
     except (EnhanceError, OSError) as exc:
         _fail(exc)
 
@@ -141,10 +160,11 @@ def query(
     profiles_dir: ProfilesOption = None,
     dbt: DbtOption = None,
     timeout: TimeoutOption = 120.0,
+    backend: BackendOption = Backend.process,
 ) -> None:
     """Run a selection in this terminal; no tmux required. Never saves the buffer."""
     try:
-        request = _request(file, sql, limit, target, profiles_dir, dbt, timeout)
+        request = _request(file, sql, limit, target, profiles_dir, dbt, timeout, backend.value)
         if json_output:
             from dbt_enhance.dbt import run_query
 
@@ -245,12 +265,36 @@ def doctor(
             override = os.environ.get("DBT_ENHANCE_DBT")
             executable = find_dbt(project, Path(override) if override else None)
             checks.append(("dbt", True, str(executable)))
-        except EnhanceError as exc:
+            from dbt_enhance.worker import project_python, status
+
+            selected = os.environ.get("DBT_ENHANCE_BACKEND", "process")
+            checks.append(("backend", selected in {"process", "worker"}, selected))
+            if selected == "worker":
+                checks.append(("worker interpreter", True, str(project_python(executable))))
+            running = status(project)
+            detail = "not running"
+            if running:
+                detail = f"running (supervisor {running['pid']}, session {running['session_pid']})"
+            checks.append(("project worker", True, detail))
+        except (EnhanceError, OSError) as exc:
             checks.append(("project/dbt", False, str(exc)))
     for name, okay, detail in checks:
         typer.echo(f"{'OK  ' if okay else 'FAIL'} {name}: {detail}")
     if not all(okay for _, okay, _ in checks):
         raise typer.Exit(1)
+
+
+@app.command(name="stop")
+def stop_worker(file: FileOption) -> None:
+    """Stop this project's warm worker, including an active query, without starting dbt."""
+    from dbt_enhance.dbt import discover_project
+    from dbt_enhance.worker import stop
+
+    try:
+        stopped = stop(discover_project(file.expanduser().absolute()))
+    except (EnhanceError, OSError) as exc:
+        _fail(exc)
+    typer.echo("Project worker stopped." if stopped else "No project worker is running.")
 
 
 def main() -> None:

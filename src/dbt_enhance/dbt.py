@@ -117,6 +117,10 @@ def run_query(
     """
 
     _validate_request(request)
+    if request.backend == "worker":
+        from .worker import run_query as run_worker_query
+
+        return run_worker_query(request, cancel, on_status)
     cancel_event = cancel if cancel is not None else threading.Event()
     if cancel_event.is_set():
         raise EnhanceError("Query was cancelled before dbt started.")
@@ -235,6 +239,8 @@ def _preview_sql(sql: str) -> str:
 
 
 def _validate_request(request: QueryRequest) -> None:
+    if not isinstance(request.backend, str) or request.backend not in {"process", "worker"}:
+        raise EnhanceError("Query backend must be 'process' or 'worker'.")
     if not isinstance(request.sql, str) or not request.sql.strip():
         raise EnhanceError("SQL must not be empty.")
     try:
@@ -299,14 +305,8 @@ class _BoundedOutput:
             return self._overflowed
 
 
-def _run_process(
-    command: list[str],
-    *,
-    cwd: Path,
-    timeout: float,
-    cancel: threading.Event,
-    on_status: Callable[[str], None] | None = None,
-) -> tuple[int, str]:
+def _child_environment() -> dict[str, str]:
+    """Shared preview defaults without modifying the editor's environment."""
     environment = os.environ.copy()
     # Connector prompts must reach the reader while authentication is pending,
     # rather than remaining in Python's block-buffered redirected stdout.
@@ -317,6 +317,18 @@ def _run_process(
     # A preview does not materialize models; skip eager whole-project relation
     # discovery. Introspection still queries on demand. Allow projects to opt back in.
     environment.setdefault("DBT_POPULATE_CACHE", "false")
+    return environment
+
+
+def _run_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    cancel: threading.Event,
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[int, str]:
+    environment = _child_environment()
     try:
         process = subprocess.Popen(
             command,
