@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 _MAX_JSON_BYTES = 16 * 1024 * 1024
-_SUPPORTED = "dbt-core 1.10.22 or 1.12.6"
+_SUPPORTED = "stable dbt-core 1.10.x or 1.12.x"
 _UNSUPPORTED_MESSAGE = (
     f"Persistent dbt sessions require {_SUPPORTED}. "
     "Install a supported dbt-core version or use the process backend."
@@ -38,6 +38,10 @@ class SessionError(RuntimeError):
     """A scrubbed error from a session that has been permanently retired."""
 
 
+class QueryError(RuntimeError):
+    """A scrubbed SQL error after successful cleanup; the session is reusable."""
+
+
 def _core_version() -> str:
     try:
         return importlib.metadata.version("dbt-core")
@@ -46,9 +50,9 @@ def _core_version() -> str:
 
 
 def _supported_version(version: str) -> bool:
-    # Private APIs need execution/retention/retirement/teardown evidence, not
-    # constructor inspection. New releases enter this list after that matrix passes.
-    return version in {"1.10.22", "1.12.6"}
+    # Admit stable patches within exercised minor lines. Private API feature
+    # detection still runs for every interpreter; prereleases remain excluded.
+    return re.fullmatch(r"1\.(?:10|12)\.(?:0|[1-9][0-9]*)", version) is not None
 
 
 def _require_symbols() -> None:
@@ -87,7 +91,7 @@ def _require_symbols() -> None:
 
 
 def compatibility() -> dict[str, str]:
-    """Return harmless version facts, or reject an untested dbt Core runtime.
+    """Return harmless version facts, or reject an unsupported dbt Core runtime.
 
     This check imports Python modules to feature-detect private APIs.  It does not
     locate/read a profile, initialize an adapter, or execute a query.
@@ -343,6 +347,52 @@ class DbtSession:
         ):
             self._adapter.connections.rollback_if_open()
 
+    def _connection_is_open(self) -> bool:
+        if self._adapter is None:
+            return False
+        connection = self._adapter.connections.get_if_exists()
+        state = importlib.import_module("dbt.adapters.contracts.connection").ConnectionState
+        if connection is None or connection.state != state.OPEN:
+            return False
+        # Only inspect the handle after checking state, never resolve a LazyHandle.
+        if self._config.credentials.type == "snowflake":
+            return not connection.handle.is_closed()
+        return True
+
+    def _is_query_error(self, error: Exception) -> bool:
+        """Recognize statement failures, not auth, transport, or internal errors.
+
+        Adapters wrap driver exceptions differently (DuckDB uses __cause__,
+        Snowflake uses __context__). Never classify by error-message text.
+        """
+        runtime_error = importlib.import_module("dbt_common.exceptions").DbtRuntimeError
+        if not isinstance(error, runtime_error):
+            return False
+        adapter_type = self._config.credentials.type
+        if adapter_type == "duckdb":
+            driver = importlib.import_module("duckdb")
+            query_errors = tuple(getattr(driver, name) for name in (
+                "ParserException", "BinderException", "CatalogException",
+                "ConversionException", "OutOfRangeException", "ConstraintException",
+            ))
+        elif adapter_type == "snowflake":
+            driver = importlib.import_module("snowflake.connector.errors")
+            query_errors = (driver.ProgrammingError,)
+        else:
+            return False
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, query_errors):
+                if adapter_type == "duckdb":
+                    return True
+                # SQLSTATE data, integrity, and syntax/access-rule errors only.
+                # Session expiration and connection/auth errors must retire.
+                return str(getattr(current, "sqlstate", ""))[:2] in {"22", "23", "42"}
+            current = current.__cause__ or current.__context__
+        return False
+
     @staticmethod
     def _table_result(table: Any) -> tuple[list[str], list[list[Any]]]:
         columns = list(table.column_names)
@@ -373,6 +423,8 @@ class DbtSession:
         task: Any = None
         runner: Any = None
         completed = False
+        recoverable = False
+        message = ""
         try:
             self._prepare_request(prepared_sql, limit)
             show = importlib.import_module("dbt.task.show")
@@ -405,10 +457,20 @@ class DbtSession:
             return response
         except Exception as error:
             message = _scrub_error(error)
-            self._retire()
-            if isinstance(error, UnsupportedSession):
-                raise UnsupportedSession(message) from None
-            raise SessionError(message) from None
+            try:
+                recoverable = (
+                    self._initialized
+                    and runner is not None
+                    and self._is_query_error(error)
+                    and self._connection_is_open()
+                )
+            except Exception:
+                recoverable = False
+            if not recoverable:
+                self._retire()
+                if isinstance(error, UnsupportedSession):
+                    raise UnsupportedSession(message) from None
+                raise SessionError(message) from None
         finally:
             try:
                 if task is not None:
@@ -425,14 +487,16 @@ class DbtSession:
                 selected = importlib.import_module("dbt.selected_resources")
                 selected.set_selected_resources(set())
                 self._rollback_open_transaction()
+                if recoverable and not self._connection_is_open():
+                    raise SessionError("dbt connection closed during query cleanup")
             except Exception as cleanup_error:
-                # An execute error has already retired the adapter; cleanup must
-                # not replace it.  If the request otherwise completed, prevent a
-                # cleanup failure from being reported as a successful response.
+                # A recoverable SQL error is only reusable after *all* cleanup
+                # succeeds. Keep the original query error if cleanup also fails.
                 if not self._closed:
                     self._retire()
-                if completed:
-                    raise SessionError(_scrub_error(cleanup_error)) from None
+                if completed or recoverable:
+                    raise SessionError(message or _scrub_error(cleanup_error)) from None
+        raise QueryError(message) from None
 
     def _retire(self) -> None:
         try:

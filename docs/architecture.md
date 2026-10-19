@@ -8,9 +8,9 @@ Helix selection (stdin) + buffer path (quoted heredoc)
   → private JSON handoff → tmux display-popup → Textual QueryApp
   → background worker → discover_project(buffer)
   → selected backend
-    process (default): project's dbt show --inline ... --output json --log-format json
+    process (explicit opt-out): project's dbt show --inline ... --output json --log-format json
       → ShowNode rows + ArtifactWritten path → run_results.json SQL
-    worker (opt-in): authenticated per-project Unix socket → stdlib supervisor
+    worker (default): authenticated per-project Unix socket → stdlib supervisor
       → persistent native dbt session in project's Python → native rows + compiled SQL
   → scrollable table + expandable SQL
 ```
@@ -22,7 +22,7 @@ be exercised through that contract without a live editor or warehouse.
 - **`dbt.py`** owns discovery, executable resolution, backend dispatch, shared child
   environment defaults, and the existing isolated-process implementation. It
   imports no dbt Core code into the tool interpreter.
-- **`worker.py`** owns the opt-in worker client, a project-scoped request lock,
+- **`worker.py`** owns the default worker client, a project-scoped request lock,
   private state, context fingerprints, interpreter selection, deadlines, and
   authenticated status/stop. It never signals a PID read from a state file.
 - **`_worker_helper.py` / `_wire.py`** form a standalone project-Python supervisor
@@ -47,8 +47,8 @@ be exercised through that contract without a live editor or warehouse.
 ## Why these decisions
 
 **External dbt, not a bundled adapter.** Users can keep incompatible adapters and
-Python versions in separate projects. The default public-CLI backend avoids
-embedding dbt's process-global state in the UI. The worker uses private Core
+Python versions in separate projects. Both backends avoid embedding dbt's
+process-global state in the UI. The worker uses private Core
 interfaces only inside its separate project-interpreter child; unsupported setups
 keep the explicit process backend rather than silently skipping native behavior.
 
@@ -78,7 +78,7 @@ writes without losing compiled SQL or empty-result column names. Neither backend
 redirects dbt to private artifact directories. Ordinary external dbt commands
 sharing the target are not serialized.
 
-**Opt-in worker lifetime.** The process backend remains the default. Worker mode
+**Default worker lifetime.** The process backend is an explicit opt-out. Worker mode
 requires a recognizable Python dbt console script; its absolute shebang interpreter
 is used without resolving away a virtualenv symlink. A stdlib-only helper runs
 under that interpreter and starts a separate native-session child. dbt-enhance
@@ -103,9 +103,14 @@ manual edits to imported Python source require an explicit stop. Sockets and sta
 files are private to the OS user, and SQL is carried over bounded JSON frames.
 
 The supervisor, not dbt's execution thread, enforces the accepted request timeout
-and observes client disconnects. Any query failure, cancellation, malformed
-execution transport, or uncertain disconnect retires the session; there is no
-automatic query replay. Stop uses authenticated IPC, not a PID file. Graceful
+and observes client disconnects. Recognized driver statement errors retain the
+session only after successful rollback/request cleanup and an open-connection
+check. DuckDB parser/binder/catalog/conversion/range/constraint errors and Snowflake
+ProgrammingError SQLSTATE classes 22, 23, and 42 are recoverable. Other failures,
+cancellation, malformed execution transport, or uncertain disconnect retire the
+session; there is no automatic query replay. Recoverable errors carry the same
+credential-file snapshots as successes, including a failed first request. The
+supervisor returns to ready only after flushing the terminal error response. Stop uses authenticated IPC, not a PID file. Graceful
 native cleanup is bounded by process termination. The separate UI timer remains
 necessary, and local cleanup still cannot guarantee remote warehouse cancellation.
 
@@ -195,8 +200,9 @@ parsing bugs. The generated mapping assumes Helix's default POSIX shell.
 ## Validation and limits
 
 `tests/test_session.py` proves native compilation/freshness, retained handles and
-temporary tables, rollback, error retirement, and physical teardown on both
-admitted Core versions. The worker/helper suites cover private IPC, frozen-child
+temporary tables, SQL-error recovery, rollback, fatal-error retirement, and physical
+teardown on representative patches of the admitted Core minors (stable 1.10.x and
+1.12.x, with private-API feature checks). The worker/helper suites cover private IPC, frozen-child
 deadlines, context/credential invalidation, no replay, and real DuckDB worker
 queries. An installed-wheel smoke also crosses a dbt-free Python 3.12 UI environment
 and a separate Python 3.10 project environment with no dbt-enhance installation.
@@ -208,7 +214,7 @@ clauses with a smaller outer cap, and relation/column introspection on a cold ca
 A repeated 14-column/10,000-row preview checks that a changed SQL selection produces
 fresh rows and compiled SQL while dbt reports `PartialParsingSkipParsing`. Other
 tests cover custom project/env artifact paths and rejection of stale run results.
-Both Core 1.10.22 and 1.12.6 have been exercised locally. Test fixtures never use
+Core 1.10.22, 1.12.5, and 1.12.6 have been exercised locally. Test fixtures never use
 user profiles and clear inherited artifact-path overrides before local testing.
 
 The optional terminal test creates a private tmux server, runs a real Helix
@@ -238,7 +244,7 @@ then timeout at 120.0 seconds with SSO guidance; the dbt child was gone at the n
 sample. The original five-minute hang occurred on `e28e588` and is considered fixed
 by v0.1.1. This evidence validates the existing process backend, not the new
 worker's Snowflake connection lifetime or cancellation, which require separate
-remote validation before changing the default.
+remote validation despite worker now being the default.
 Cancellation cannot guarantee remote warehouse cancellation. Neither dbt compilation nor `show` is a read-only
 security boundary; trusted macros and least-privilege warehouse credentials are
 still required.

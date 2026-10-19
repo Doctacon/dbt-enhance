@@ -26,6 +26,12 @@ from pathlib import Path
 class UnsupportedSession(Exception):
     pass
 
+class QueryError(RuntimeError):
+    pass
+
+class SessionError(RuntimeError):
+    pass
+
 def compatibility():
     return {"dbt_core": "test", "python": "test"}
 
@@ -46,7 +52,11 @@ class DbtSession:
             print("https://example.invalid/auth?token=DO_NOT_FORWARD", flush=True)
             time.sleep(60)
         if sql == "fail":
-            raise RuntimeError("deliberate SQL error")
+            raise QueryError("deliberate SQL error")
+        if sql == "fatal":
+            raise RuntimeError("deliberate fatal error")
+        if sql == "cleanup-fail":
+            raise SessionError("deliberate cleanup failure")
         if sql == "uncertain":
             with (self.project / "execution-count").open("a") as f:
                 f.write("executed\\n")
@@ -225,14 +235,68 @@ def test_context_or_credentials_change_recycles_worker(setup_worker, monkeypatch
         assert after.rows[0][2] == "changed"
 
 
-def test_query_error_retires_then_next_request_starts_fresh(setup_worker):
+def test_query_error_reuses_session_without_replaying_sql(setup_worker):
     _, request = setup_worker
     before = worker.run_query(request)
     with pytest.raises(EnhanceError, match="deliberate SQL error"):
         worker.run_query(replace(request, sql="fail"))
     after = worker.run_query(request)
+    assert after.rows[0][0] == before.rows[0][0]
+    assert after.rows[0][1] == 3
+
+
+@pytest.mark.parametrize("failure", ["watched", "message", "cancelled"])
+def test_reusable_error_still_retires_on_malformed_reply_or_cancellation(
+    setup_worker, monkeypatch, failure
+):
+    _, request = setup_worker
+    before = worker.run_query(request)
+    cancel = threading.Event()
+    receive = worker._receive
+
+    def receive_error(*args, **kwargs):
+        message = receive(*args, **kwargs)
+        if message.get("reusable") is True:
+            if failure == "cancelled":
+                cancel.set()
+            else:
+                message[failure] = None
+        return message
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "_receive", receive_error)
+        with pytest.raises(EnhanceError, match="malformed|cancelled"):
+            worker.run_query(replace(request, sql="fail"), cancel)
+    after = worker.run_query(request)
+    assert after.rows[0][0] != before.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [("fatal", "deliberate fatal error"), ("cleanup-fail", "deliberate cleanup failure")],
+)
+def test_fatal_and_cleanup_errors_retire_session(setup_worker, sql, message):
+    _, request = setup_worker
+    before = worker.run_query(request)
+    with pytest.raises(EnhanceError, match=message):
+        worker.run_query(replace(request, sql=sql))
+    after = worker.run_query(request)
     assert after.rows[0][0] != before.rows[0][0]
     assert after.rows[0][1] == 1
+
+
+def test_first_query_error_persists_credential_snapshot(setup_worker):
+    project, request = setup_worker
+    with pytest.raises(EnhanceError, match="deliberate SQL error"):
+        worker.run_query(replace(request, sql="fail"))
+    directory, _ = worker._slot(project.resolve(), worker._Deadline(2), create=False)
+    before = json.loads((directory / "control.json").read_text())
+    assert len(before["watched"]) == 1
+
+    (project / "credential.key").write_text("synthetic-rotated-key")
+    result = worker.run_query(request)
+    assert result.rows[0][0] != before["session_pid"]
+    assert result.rows[0][1] == 1
 
 
 def test_crash_after_execution_is_never_replayed_or_sent_to_cli(setup_worker, monkeypatch):

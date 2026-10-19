@@ -191,6 +191,23 @@ def test_find_dbt_invalid_override_is_actionable(tmp_path: Path) -> None:
         find_dbt(tmp_path, tmp_path / "missing")
 
 
+def test_run_query_dispatches_to_worker_by_default(tmp_path: Path, monkeypatch) -> None:
+    from dbt_enhance import worker
+
+    request = QueryRequest(sql="select 1", file=tmp_path / "model.sql")
+    sentinel = object()
+    calls = []
+
+    def worker_query(received, cancel, on_status):
+        calls.append((received, cancel, on_status))
+        return sentinel
+
+    monkeypatch.setattr(worker, "run_query", worker_query)
+    assert run_query(request) is sentinel
+    assert request.backend == "worker"
+    assert calls == [(request, None, None)]
+
+
 def test_run_query_reuses_project_paths_and_preserves_json_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,6 +226,7 @@ def test_run_query_reuses_project_paths_and_preserves_json_values(
             target="qa",
             profiles_dir=tmp_path / "profiles with spaces",
             dbt=dbt,
+            backend="process",
         ),
         on_status=statuses.append,
     )
@@ -254,7 +272,9 @@ def test_child_environment_preserves_profile_inputs(tmp_path, monkeypatch, platf
     else:
         monkeypatch.setenv("SNOWFLAKE_DISABLE_PLATFORM_DETECTION", platform_detection)
 
-    run_query(QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path)))
+    run_query(
+        QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+    )
 
     import os
 
@@ -292,7 +312,7 @@ def test_preview_normalizes_delimiter_and_literal_outer_limit(tmp_path, monkeypa
     _, source = _make_project(tmp_path)
     record = tmp_path / "arguments.json"
     monkeypatch.setenv("FAKE_DBT_RECORD", str(record))
-    run_query(QueryRequest(sql=sql, file=source, dbt=_make_fake_dbt(tmp_path)))
+    run_query(QueryRequest(sql=sql, file=source, dbt=_make_fake_dbt(tmp_path), backend="process"))
     args = json.loads(record.read_text())
     assert args[args.index("--inline") + 1] == expected
 
@@ -300,7 +320,9 @@ def test_preview_normalizes_delimiter_and_literal_outer_limit(tmp_path, monkeypa
 def test_wide_show_event_larger_than_one_mib_is_not_truncated(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
 
-    result = run_query(QueryRequest(sql="WIDE", file=source, dbt=_make_fake_dbt(tmp_path)))
+    result = run_query(
+        QueryRequest(sql="WIDE", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+    )
 
     assert result.columns == ["wide"]
     assert len(result.rows[0][0]) == 700_000
@@ -312,7 +334,11 @@ def test_output_overflow_is_actionable_instead_of_parsed_as_success(
     _, source = _make_project(tmp_path)
 
     with pytest.raises(EnhanceError, match="16 MiB.*Lower --limit.*fewer columns"):
-        run_query(QueryRequest(sql="OVERFLOW", file=source, dbt=_make_fake_dbt(tmp_path)))
+        run_query(
+            QueryRequest(
+                sql="OVERFLOW", file=source, dbt=_make_fake_dbt(tmp_path), backend="process"
+            )
+        )
 
 
 @pytest.mark.parametrize("darwin", [True, False])
@@ -328,7 +354,9 @@ def test_exited_group_permission_race_is_only_ignored_on_macos(tmp_path, monkeyp
         raise PermissionError(errno.EPERM, "exited process group")
 
     monkeypatch.setattr(dbt.os, "killpg", exited_group)
-    request = QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path))
+    request = QueryRequest(
+        sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path), backend="process"
+    )
     if darwin:
         assert run_query(request).rows == [[None, True, "plain"]]
     else:
@@ -340,7 +368,9 @@ def test_successful_leader_cleans_child_holding_stdout(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
     started = time.monotonic()
 
-    result = run_query(QueryRequest(sql="CHILD", file=source, dbt=_make_fake_dbt(tmp_path)))
+    result = run_query(
+        QueryRequest(sql="CHILD", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+    )
 
     assert result.rows == [[None, True, "plain"]]
     assert time.monotonic() - started < 2
@@ -363,7 +393,7 @@ def test_run_query_validates_before_starting(
     values = {"sql": "select 1", "file": source, "dbt": tmp_path / "missing"}
     values.update(changes)
     with pytest.raises(EnhanceError, match=message):
-        run_query(QueryRequest(**values))  # type: ignore[arg-type]
+        run_query(QueryRequest(**values, backend="process"))  # type: ignore[arg-type]
 
 
 def test_run_query_validates_utf8_sql_size_before_starting(tmp_path: Path) -> None:
@@ -376,13 +406,16 @@ def test_run_query_validates_utf8_sql_size_before_starting(tmp_path: Path) -> No
                 sql=oversized_multibyte_sql,
                 file=source,
                 dbt=tmp_path / "missing",
+                backend="process",
             )
         )
 
 
 def test_empty_preview_has_explicit_column_limitation(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
-    result = run_query(QueryRequest(sql="EMPTY", file=source, dbt=_make_fake_dbt(tmp_path)))
+    result = run_query(
+        QueryRequest(sql="EMPTY", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+    )
     assert result.columns == []
     assert result.rows == []
     assert "does not include column metadata" in result.warnings[0]
@@ -391,7 +424,9 @@ def test_empty_preview_has_explicit_column_limitation(tmp_path: Path) -> None:
 def test_dbt_failure_is_structured_and_actionable(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
     with pytest.raises(EnhanceError, match="Database Error: database exploded"):
-        run_query(QueryRequest(sql="FAIL", file=source, dbt=_make_fake_dbt(tmp_path)))
+        run_query(
+            QueryRequest(sql="FAIL", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+        )
 
 
 @pytest.mark.parametrize(
@@ -408,7 +443,9 @@ def test_success_without_required_dbt_output_is_an_error(
 ) -> None:
     _, source = _make_project(tmp_path)
     with pytest.raises(EnhanceError, match=message):
-        run_query(QueryRequest(sql=sql, file=source, dbt=_make_fake_dbt(tmp_path)))
+        run_query(
+            QueryRequest(sql=sql, file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+        )
 
 
 @pytest.mark.parametrize("absolute", [False, True])
@@ -416,7 +453,9 @@ def test_compiled_sql_uses_reported_custom_artifact_path(tmp_path, monkeypatch, 
     project, source = _make_project(tmp_path)
     target = tmp_path / "absolute artifacts" if absolute else Path("custom artifacts")
     monkeypatch.setenv("DBT_TARGET_PATH", str(target))
-    result = run_query(QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path)))
+    result = run_query(
+        QueryRequest(sql="select 1", file=source, dbt=_make_fake_dbt(tmp_path), backend="process")
+    )
     assert result.compiled_sql.endswith("limit 500")
     assert (project / target / "run_results.json").is_file()
     assert not (project / "target").exists()
@@ -425,11 +464,11 @@ def test_compiled_sql_uses_reported_custom_artifact_path(tmp_path, monkeypatch, 
 def test_missing_artifact_never_reuses_a_previous_query_file(tmp_path):
     project, source = _make_project(tmp_path)
     dbt = _make_fake_dbt(tmp_path)
-    run_query(QueryRequest(sql="select 1", file=source, dbt=dbt))
+    run_query(QueryRequest(sql="select 1", file=source, dbt=dbt, backend="process"))
     artifact = project / "target" / "run_results.json"
     before = artifact.read_bytes()
     with pytest.raises(EnhanceError, match="did not report a run_results.json"):
-        run_query(QueryRequest(sql="NO_ARTIFACT", file=source, dbt=dbt))
+        run_query(QueryRequest(sql="NO_ARTIFACT", file=source, dbt=dbt, backend="process"))
     assert artifact.read_bytes() == before
 
 
@@ -442,7 +481,13 @@ def test_cancellation_returns_quickly(tmp_path: Path) -> None:
     try:
         with pytest.raises(EnhanceError, match="cancelled"):
             run_query(
-                QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=20),
+                QueryRequest(
+                    sql="SLEEP",
+                    file=source,
+                    dbt=_make_fake_dbt(tmp_path),
+                    timeout=20,
+                    backend="process",
+                ),
                 cancel=cancel,
             )
     finally:
@@ -462,7 +507,9 @@ def test_sso_progress_arrives_before_timeout_without_exposing_login_url(tmp_path
 
     with pytest.raises(EnhanceError, match="cancelled"):
         run_query(
-            QueryRequest(sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=1),
+            QueryRequest(
+                sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=1, backend="process"
+            ),
             cancel=cancel,
             on_status=progress,
         )
@@ -475,7 +522,11 @@ def test_sso_progress_arrives_before_timeout_without_exposing_login_url(tmp_path
 def test_sso_eof_explains_terminal_login_and_does_not_show_auth_url(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
     with pytest.raises(EnhanceError) as error:
-        run_query(QueryRequest(sql="SSO EOF", file=source, dbt=_make_fake_dbt(tmp_path)))
+        run_query(
+            QueryRequest(
+                sql="SSO EOF", file=source, dbt=_make_fake_dbt(tmp_path), backend="process"
+            )
+        )
     message = str(error.value)
     assert "dbt debug" in message
     assert "terminal" in message
@@ -487,7 +538,11 @@ def test_sso_eof_explains_terminal_login_and_does_not_show_auth_url(tmp_path: Pa
 def test_sso_timeout_includes_login_guidance(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
     with pytest.raises(EnhanceError) as error:
-        run_query(QueryRequest(sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.5))
+        run_query(
+            QueryRequest(
+                sql="SSO", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.5, backend="process"
+            )
+        )
     assert "timed out" in str(error.value)
     assert "dbt debug" in str(error.value)
     assert "DO-NOT-DISPLAY" not in str(error.value)
@@ -508,7 +563,13 @@ def test_timeout_is_not_masked_by_cleanup_permission_error(tmp_path: Path, monke
     try:
         with pytest.raises(EnhanceError, match="timed out"):
             run_query(
-                QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.1)
+                QueryRequest(
+                    sql="SLEEP",
+                    file=source,
+                    dbt=_make_fake_dbt(tmp_path),
+                    timeout=0.1,
+                    backend="process",
+                )
             )
     finally:
         for process in processes:
@@ -533,7 +594,13 @@ def test_timeout_survives_a_process_that_cannot_be_reaped(tmp_path: Path, monkey
     try:
         with pytest.raises(EnhanceError, match="timed out"):
             run_query(
-                QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.1)
+                QueryRequest(
+                    sql="SLEEP",
+                    file=source,
+                    dbt=_make_fake_dbt(tmp_path),
+                    timeout=0.1,
+                    backend="process",
+                )
             )
     finally:
         # The real fixture process is killable; reap it outside the simulated OS failure.
@@ -545,5 +612,13 @@ def test_timeout_returns_quickly(tmp_path: Path) -> None:
     _, source = _make_project(tmp_path)
     started = time.monotonic()
     with pytest.raises(EnhanceError, match="timed out"):
-        run_query(QueryRequest(sql="SLEEP", file=source, dbt=_make_fake_dbt(tmp_path), timeout=0.1))
+        run_query(
+            QueryRequest(
+                sql="SLEEP",
+                file=source,
+                dbt=_make_fake_dbt(tmp_path),
+                timeout=0.1,
+                backend="process",
+            )
+        )
     assert time.monotonic() - started < 3

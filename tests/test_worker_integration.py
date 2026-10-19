@@ -130,8 +130,11 @@ def test_real_worker_wide_previews_have_fresh_rows_and_sql(native_worker):
     print(f"worker 14 x 10000 cold={results[0].elapsed:.3f}s warm={results[1].elapsed:.3f}s")
 
 
-@pytest.mark.skipif(version("dbt-core") != "1.12.6", reason="Core 1.12 loads project dotenv files")
-def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch):
+@pytest.mark.skipif(
+    not version("dbt-core").startswith("1.12."), reason="Core 1.12 loads project dotenv files"
+)
+@pytest.mark.parametrize("failed_first_query", [False, True])
+def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch, failed_first_query):
     project, request = native_worker
     monkeypatch.setenv("HOME", str(project.parent / "synthetic-home"))
     monkeypatch.delenv("PYTHON_DOTENV_DISABLED")
@@ -140,7 +143,11 @@ def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch):
     (project / ".env").write_text(f"DBT_PROFILES_DIR='{request.profiles_dir}'\n")
     profile = request.profiles_dir / "profiles.yml"
     request = replace(request, profiles_dir=None, sql="select '{{ target.name }}' as target_name")
-    assert run_query(request).rows == [["dev"]]
+    if failed_first_query:
+        with pytest.raises(EnhanceError):
+            run_query(replace(request, sql="select from"))
+    else:
+        assert run_query(request).rows == [["dev"]]
     before = worker.status(project.resolve())["session_pid"]
     profile.write_text(
         profile.read_text()
@@ -154,15 +161,20 @@ def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch):
     assert worker.status(project.resolve())["session_pid"] != before
 
 
-def test_real_worker_error_retires_and_new_request_recovers(native_worker):
+@pytest.mark.parametrize("bad_sql", ["select * from missing_test_table", "select from"])
+def test_real_worker_query_error_keeps_session_and_connection(native_worker, bad_sql):
     project, request = native_worker
-    run_query(request)
+    run_query(replace(
+        request,
+        sql="{% do run_query('create temp table kept_after_error as select 73 as marker') %} "
+        "select 1 as value",
+    ))
     before = worker.status(project.resolve())["session_pid"]
     with pytest.raises(EnhanceError):
-        run_query(replace(request, sql="select * from missing_test_table"))
-    recovered = run_query(request)
-    assert recovered.rows == [[1]]
-    assert worker.status(project.resolve())["session_pid"] != before
+        run_query(replace(request, sql=bad_sql))
+    recovered = run_query(replace(request, sql="select * from kept_after_error"))
+    assert recovered.rows == [[73]]
+    assert worker.status(project.resolve())["session_pid"] == before
 
 
 def test_real_worker_timeout_kills_active_session_and_allows_restart(native_worker):

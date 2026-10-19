@@ -74,6 +74,21 @@ def _safe_message(value: object) -> str:
     return data.decode("utf-8", "ignore") or "Worker failed."
 
 
+def _valid_watched(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= 128
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"path", "digest"}
+            and isinstance(item["path"], str)
+            and isinstance(item["digest"], str)
+            and _HEX64.fullmatch(item["digest"]) is not None
+            for item in value
+        )
+    )
+
+
 def _read_bootstrap() -> dict[str, Any]:
     chunks: list[bytes] = []
     size = 0
@@ -322,7 +337,23 @@ def _session_main(fd_text: str) -> int:
             request_id = command.get("request_id")
             sql = command.get("sql")
             limit = command.get("limit")
-            result = dbt_session.execute(sql, limit)
+            try:
+                result = dbt_session.execute(sql, limit)
+            except session_module.QueryError as error:
+                # QueryError means dbt completed rollback/request cleanup and
+                # verified that the native connection remains usable. Preserve
+                # any credential baselines discovered by the failed request.
+                _child_send(
+                    sock,
+                    {
+                        "type": "error",
+                        "request_id": request_id,
+                        "message": _child_scrub(error, session_module),
+                        "reusable": True,
+                        "watched": watched,
+                    },
+                )
+                continue
             try:
                 _child_send(
                     sock,
@@ -763,7 +794,7 @@ class _Supervisor:
             kind == "result"
             and message.get("request_id") == self.request_id
             and isinstance(message.get("result"), dict)
-            and isinstance(message.get("watched"), list)
+            and _valid_watched(message.get("watched"))
         ):
             assert self.active is not None
             self.active.result_pending = True
@@ -774,6 +805,27 @@ class _Supervisor:
                     "request_id": self.request_id,
                     "result": message["result"],
                     "watched": message["watched"],
+                },
+            )
+            return
+        if (
+            kind == "error"
+            and message.get("request_id") == self.request_id
+            and message.get("reusable") is True
+            and isinstance(message.get("message"), str)
+            and _valid_watched(message.get("watched"))
+        ):
+            assert self.active is not None
+            self.active.result_pending = True
+            self._queue(
+                self.active,
+                {
+                    "type": "error",
+                    "request_id": self.request_id,
+                    "message": _safe_message(message["message"]),
+                    "reusable": True,
+                    "watched": message["watched"],
+                    "sso": self.sso_sent,
                 },
             )
             return

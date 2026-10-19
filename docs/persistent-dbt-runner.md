@@ -1,8 +1,8 @@
 # Persistent dbt process and connection reuse
 
-Status: an **experimental opt-in worker is implemented in this checkout**;
-`process` remains the default. Native lifecycle tests pass on Core **1.10.22** and
-**1.12.6** with local DuckDB. No live Snowflake/WSL worker validation or release is
+Status: the **persistent worker is the default in this checkout**;
+`--backend process` opts out. Native lifecycle tests have passed on Core **1.10.22**,
+**1.12.5**, and **1.12.6** with local DuckDB. No live Snowflake/WSL worker validation or release is
 claimed. The original process-only experiment below remains separate evidence.
 
 ## Recommendation
@@ -17,7 +17,7 @@ These are separate optimizations:
 | Retained state | Avoided work | Current status |
 | --- | --- | --- |
 | `partial_parse.msgpack` | Full project parsing when the cache is valid | Implemented |
-| Python process and imports | Python/dbt/adapter module cold starts | Implemented in opt-in worker |
+| Python process and imports | Python/dbt/adapter module cold starts | Implemented in default worker |
 | Warehouse connection/session | Repeated connection and authentication setup | DuckDB retention verified; Snowflake not yet verified |
 | Query results | Re-execution of selected SQL | Not proposed; each selection must execute freshly |
 
@@ -86,16 +86,20 @@ Compiled SQL and typed rows come from the native result; empty-result column nam
 are retained without writing JSON result/manifest artifacts. Normal partial-parse
 cache and log paths remain authoritative.
 
-Support is deliberately gated to **exact Core 1.10.22 and 1.12.6**, not a speculative
-minor-version range or constructor-signature check. The regression matrix proves,
-for both versions with dbt-duckdb 1.9.6:
+Support admits stable patches in **Core 1.10.x and 1.12.x**, including **1.12.5**.
+Other minor lines, prereleases, and suffixed builds are rejected. Startup still
+feature-detects the required private APIs. Historical regression measurements use
+Core 1.10.22 and 1.12.6 with dbt-duckdb 1.9.6; admission does not imply every patch
+was individually tested. The updated session/recovery/worker suite also passes on
+Core **1.12.5**. The regression suite covers:
 
 - Native compilation/execution, changed selections, edited models/macros/sources,
   fresh invocation IDs/times, preview limits, and empty-result columns.
 - The identical retained adapter handle and a surviving connection-local temporary
   table, including a series of repeated requests.
-- SQL/output failures retire the session; a fresh session recovers without keeping
-  the failed session's temporary objects. No failed query is replayed.
+- Recognized SQL statement errors retain the session and temporary objects after
+  successful rollback and cleanup. Unknown/internal, connection/authentication,
+  cleanup, and output-cap failures still retire it. No failed query is replayed.
 - Tracked transactions roll back, explicit close is idempotent, the native
   connection is marked closed, and **another process can open the same writable
   DuckDB database after close**. Checking only an empty adapter registry was not
@@ -185,7 +189,7 @@ credential-rotation, and cancellation behavior still need validation. [6]
 ## Worker boundaries
 
 The current `QueryRunner` interface is preserved: request, cancellation event,
-progress callback, and `QueryResult`. The opt-in implementation owns:
+progress callback, and `QueryResult`. The default worker implementation owns:
 
 1. **A lazily started project-local process.** Use the interpreter/environment of
    the resolved dbt executable, not the uv tool's environment. Custom executable

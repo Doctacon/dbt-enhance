@@ -83,6 +83,7 @@ select 0 as id
             profiles_dir=profiles,
             dbt=_dbt_executable(),
             timeout=60,
+            backend="process",
         )
     )
 
@@ -128,6 +129,7 @@ def test_real_dbt_reuses_project_partial_parse_cache_for_changed_selection(tmp_p
                 profiles_dir=profiles,
                 dbt=_dbt_executable(),
                 limit=10000,
+                backend="process",
             )
         )
 
@@ -171,6 +173,7 @@ def test_real_dbt_honors_custom_artifact_and_log_paths(tmp_path, monkeypatch, co
             file=source,
             profiles_dir=profiles,
             dbt=_dbt_executable(),
+            backend="process",
         )
     )
     assert result.rows == [[42]]
@@ -193,6 +196,7 @@ def test_real_dbt_terminal_semicolon_with_comment_preserves_literals_and_limit(t
             profiles_dir=profiles,
             dbt=_dbt_executable(),
             limit=2,
+            backend="process",
         )
     )
     assert result.rows == [[42, "literal;"], [42, "literal;"]]
@@ -210,6 +214,7 @@ def test_real_dbt_existing_limit_keeps_both_selection_and_preview_caps(tmp_path,
             profiles_dir=profiles,
             dbt=_dbt_executable(),
             limit=2,
+            backend="process",
         )
     )
     assert len(result.rows) == min(inner_limit, 2)
@@ -249,6 +254,7 @@ def test_real_dbt_introspection_works_without_eager_cache_population(tmp_path, m
             profiles_dir=profiles,
             dbt=_dbt_executable(),
             limit=2,
+            backend="process",
         )
     )
     assert result.columns == ["id", "label"]
@@ -268,6 +274,7 @@ def test_real_dbt_empty_preview_and_database_error_are_structured(
             profiles_dir=profiles,
             dbt=dbt,
             timeout=60,
+            backend="process",
         )
     )
     assert empty.columns == []
@@ -282,5 +289,6 @@ def test_real_dbt_empty_preview_and_database_error_are_structured(
                 profiles_dir=profiles,
                 dbt=dbt,
                 timeout=60,
+                backend="process",
             )
         )

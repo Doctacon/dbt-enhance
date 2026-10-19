@@ -118,20 +118,42 @@ def test_setup_installs_stable_tool_before_config(tmp_path, monkeypatch):
     assert str(binary) in config.read_text()
 
 
-def test_worker_backend_is_explicit_and_passed_through_popup(tmp_path, monkeypatch):
+def test_worker_backend_is_default_with_explicit_process_opt_out(tmp_path, monkeypatch):
     from dbt_enhance import popup
 
     captured = []
     monkeypatch.setattr(popup, "launch_popup", captured.append)
     args = ["popup", "--file", str(tmp_path / "model.sql")]
     assert runner.invoke(app, args, input="select 1").exit_code == 0
-    assert captured[-1].backend == "process"
-    monkeypatch.setenv("DBT_ENHANCE_BACKEND", "worker")
-    assert runner.invoke(app, args, input="select 1").exit_code == 0
     assert captured[-1].backend == "worker"
     assert runner.invoke(app, [*args, "--backend", "process"], input="select 1").exit_code == 0
     assert captured[-1].backend == "process"
+    monkeypatch.setenv("DBT_ENHANCE_BACKEND", "process")
+    assert runner.invoke(app, args, input="select 1").exit_code == 0
+    assert captured[-1].backend == "process"
+    assert runner.invoke(app, [*args, "--backend", "worker"], input="select 1").exit_code == 0
+    assert captured[-1].backend == "worker"
     assert runner.invoke(app, [*args, "--backend", "invalid"], input="select 1").exit_code != 0
+
+
+def test_query_command_uses_worker_default(tmp_path, monkeypatch):
+    from dbt_enhance import ui
+
+    captured = []
+
+    class FakeApp:
+        def __init__(self, *, request):
+            captured.append(request)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(ui, "QueryApp", FakeApp)
+    args = ["query", "--file", str(tmp_path / "model.sql"), "--sql", "select 1"]
+    assert runner.invoke(app, args).exit_code == 0
+    assert captured[-1].backend == "worker"
+    assert runner.invoke(app, [*args, "--backend", "process"]).exit_code == 0
+    assert captured[-1].backend == "process"
 
 
 def test_stop_resolves_project_without_starting_a_query(tmp_path, monkeypatch):

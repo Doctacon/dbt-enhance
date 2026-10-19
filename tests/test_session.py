@@ -73,6 +73,7 @@ def _run_child(project: Path, profiles: Path, body: str) -> subprocess.Completed
         spec.loader.exec_module(module)
         DbtSession = module.DbtSession
         SessionError = module.SessionError
+        QueryError = module.QueryError
         UnsupportedSession = module.UnsupportedSession
         project = Path({str(project)!r})
         profiles = Path({str(profiles)!r})
@@ -239,7 +240,7 @@ def test_native_session_retains_connection_and_refreshes_project(tmp_path: Path)
 
 
 @pytest.mark.integration
-def test_errors_and_output_cap_retire_then_fresh_session_recovers(tmp_path: Path) -> None:
+def test_query_errors_recover_but_output_cap_retires(tmp_path: Path) -> None:
     project, profiles = _project(tmp_path)
     completed = _run_child(
         project,
@@ -251,14 +252,27 @@ def test_errors_and_output_cap_retire_then_fresh_session_recovers(tmp_path: Path
             "{% do run_query('create temporary table failed_session_marker as select 1') %} "
             "select 1 as value", 2,
         )
+        connection = failed._adapter.connections.get_thread_connection()
+        handle = connection.handle
+        # An error in an explicit transaction must roll back without closing it.
+        failed._adapter.connections.begin()
+        assert connection.transaction_open
         try:
             failed.execute("select * from relation_that_does_not_exist", 2)
-        except SessionError as error:
+        except QueryError as error:
             outcomes["database_error"] = str(error)
+        assert not connection.transaction_open
+        assert connection.handle is handle
+        outcomes["retained"] = failed.execute("select * from failed_session_marker", 2)["rows"]
+        # Also cover errors from SQL invoked during Jinja compilation.
         try:
-            failed.execute("select 1", 2)
-        except SessionError as error:
-            outcomes["failed_closed"] = str(error)
+            failed.execute("{% do run_query('select from') %} select 1", 2)
+        except QueryError:
+            pass
+        else:
+            raise AssertionError("invalid SQL unexpectedly succeeded")
+        assert failed.execute("select 1", 2)["rows"] == [[1]]
+        assert not any("inline_query" in key for key in failed._manifest.nodes)
         failed.close()
         failed.close()
 
@@ -296,12 +310,49 @@ def test_errors_and_output_cap_retire_then_fresh_session_recovers(tmp_path: Path
     assert "unraisable" not in completed.stderr.lower()
     report = json.loads(completed.stdout)
     assert "relation_that_does_not_exist" in report["database_error"]
-    assert "closed" in report["failed_closed"]
+    assert report["retained"] == [[1]]
     assert report["recovered"] == [[7]]
     assert "16 MiB" in report["cap_error"]
     assert "closed" in report["cap_closed"]
     assert report["after_cap"] == [[8]]
     assert report["factory_empty_after_close"] is True
+
+
+@pytest.mark.integration
+def test_first_query_error_recovers_but_cleanup_failure_retires(tmp_path: Path) -> None:
+    project, profiles = _project(tmp_path)
+    completed = _run_child(
+        project,
+        profiles,
+        r"""
+        session = DbtSession(context)
+        try:
+            session.execute("select from", 2)
+        except QueryError:
+            pass
+        else:
+            raise AssertionError("invalid query succeeded")
+        assert session.execute("select 9 as value", 2)["rows"] == [[9]]
+        def broken_rollback():
+            raise RuntimeError("synthetic cleanup failure")
+        session._rollback_open_transaction = broken_rollback
+        try:
+            session.execute("select * from missing_table", 2)
+        except SessionError as error:
+            assert "missing_table" in str(error)
+        else:
+            raise AssertionError("failed cleanup must retire")
+        assert session._closed
+        try:
+            session.execute("select 1", 2)
+        except SessionError as error:
+            assert "closed" in str(error)
+        else:
+            raise AssertionError("retired session reused")
+        session.close()
+        """,
+    )
+    assert completed.returncode == 0, completed.stderr + completed.stdout
 
 
 def test_compatibility_does_not_read_profiles(
@@ -357,10 +408,17 @@ def test_context_validation_is_lazy_and_does_not_import_dbt() -> None:
 
     supported_version = namespace["_supported_version"]
     assert supported_version("1.10.22") is True
-    assert supported_version("1.10.21") is False
+    assert supported_version("1.10.21") is True
     assert supported_version("1.11.0") is False
     assert supported_version("1.12.6") is True
-    assert supported_version("1.10.23") is False
-    assert supported_version("1.12.7") is False
+    assert supported_version("1.10.23") is True
+    assert supported_version("1.12.5") is True
+    assert supported_version("1.12.7") is True
+    assert supported_version("1.12.0") is True
+    assert supported_version("1.12.7rc1") is False
+    assert supported_version("1.12.7.dev1") is False
+    assert supported_version("1.12.7+local") is False
+    assert supported_version("1.12") is False
+    assert supported_version("garbage") is False
     assert supported_version("1.12.6.post1") is False
     assert supported_version("1.13.0") is False

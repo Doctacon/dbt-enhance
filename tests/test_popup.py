@@ -30,6 +30,7 @@ def test_popup_private_transport_and_cleanup(tmp_path, monkeypatch):
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
         payload = json.loads(path.read_text())
         assert payload["request"]["sql"] == request.sql
+        assert payload["request"]["backend"] == "worker"
         assert payload["environment"]["DBT_TEST_SECRET"] == "private-token"
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -72,6 +73,7 @@ def test_handoff_preserves_credentials_but_uses_popup_terminal(tmp_path, monkeyp
     monkeypatch.setattr(os, "environ", {"TERM": "popup-term", "STALE_PASSWORD": "bad"})
     result = popup.read_request(path, consume=True)
     assert result.file == tmp_path / "orders.sql"
+    assert result.backend == "worker"
     assert not path.exists()
     assert os.environ == {"TERM": "popup-term", "PATH": "/editor/bin", "MY_PASSWORD": "secret"}
 

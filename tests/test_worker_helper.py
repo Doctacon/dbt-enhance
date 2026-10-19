@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from dbt_enhance._wire import MAX_REQUEST, PROTOCOL, Decoder, encode
-from dbt_enhance._worker_helper import watch_files
+from dbt_enhance._worker_helper import _Client, _Supervisor, watch_files
 
 _ROOT = Path(__file__).parents[1]
 _HELPER = _ROOT / "src/dbt_enhance/_worker_helper.py"
@@ -30,6 +30,12 @@ import re
 import time
 
 _URL = re.compile(r"https?://[^\s]+")
+
+class QueryError(RuntimeError):
+    pass
+
+class SessionError(RuntimeError):
+    pass
 
 def compatibility():
     if os.environ.get("FAKE_INCOMPATIBLE") == "1":
@@ -60,6 +66,10 @@ class DbtSession:
         self.count += 1
         if sql.startswith("sleep:"):
             time.sleep(float(sql.split(":", 1)[1]))
+        if sql == "query-error":
+            raise QueryError("deliberate query error")
+        if sql == "cleanup-error":
+            raise SessionError("deliberate cleanup error")
         if sql == "sso-error":
             print(
                 "Initiating login request with your identity provider "
@@ -297,6 +307,90 @@ def test_authentication_retained_session_busy_and_watches(tmp_path: Path) -> Non
         second.close()
     finally:
         _stop(process, path)
+
+
+def test_recoverable_query_error_keeps_session_and_credential_snapshot(tmp_path: Path) -> None:
+    process, path, project, _ = _start(tmp_path)
+    credential = project / "credential.pem"
+    credential.write_text("first-secret")
+    try:
+        first, first_decoder, ready = _connect(path)
+        session_pid = ready["session_pid"]
+        error = _execute(first, first_decoder, "query-error")[-1]
+        assert error["type"] == "error"
+        assert error["message"] == "deliberate query error"
+        assert error["reusable"] is True
+        assert error["sso"] is False
+        assert len(error["watched"]) == 1
+        assert "first-secret" not in json.dumps(error)
+        first.close()
+
+        second, second_decoder, second_ready = _connect(path)
+        result = _execute(second, second_decoder, "select after error")[-1]
+        assert result["type"] == "result"
+        assert result["result"]["session_pid"] == session_pid
+        assert second_ready["session_pid"] == session_pid
+        assert result["result"]["rows"] == [[2]]
+        assert result["watched"] == error["watched"]
+        second.close()
+        assert process.poll() is None
+    finally:
+        _stop(process, path)
+
+
+def test_session_cleanup_error_remains_fatal(tmp_path: Path) -> None:
+    process, path, _, _ = _start(tmp_path)
+    sock, decoder, _ = _connect(path)
+    error = _execute(sock, decoder, "cleanup-error")[-1]
+    assert error["type"] == "error"
+    assert error.get("reusable") is not True
+    assert "cleanup error" in error["message"]
+    process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "type": "error",
+            "request_id": "b" * 32,
+            "message": "wrong request",
+            "reusable": True,
+            "watched": [],
+        },
+        {
+            "type": "error",
+            "request_id": "a" * 32,
+            "message": "bad snapshot",
+            "reusable": True,
+            "watched": [{"path": "/tmp/key", "digest": "bad"}],
+        },
+        {
+            "type": "error",
+            "request_id": "a" * 32,
+            "message": "not explicitly reusable",
+            "reusable": 1,
+            "watched": [],
+        },
+    ],
+)
+def test_malformed_recoverable_error_retires_supervisor(
+    tmp_path: Path, message: dict[str, Any]
+) -> None:
+    supervisor = _Supervisor(tmp_path, "c" * 32, _TOKEN, {}, 10)
+    server, peer = socket.socketpair()
+    client = _Client(server, authenticated=True)
+    supervisor.state = "active"
+    supervisor.active = client
+    supervisor.request_id = "a" * 32
+    try:
+        supervisor._child_message(message, time.monotonic())
+        assert supervisor.state == "retiring"
+        assert client.result_pending is False
+    finally:
+        server.close()
+        peer.close()
+        supervisor.selector.close()
 
 
 def test_watch_files_is_keyed_bounded_and_tracks_existence(tmp_path: Path) -> None:

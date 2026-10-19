@@ -66,7 +66,7 @@ BackendOption = Annotated[
     typer.Option(
         "--backend",
         envvar="DBT_ENHANCE_BACKEND",
-        help="process: one dbt invocation per query; worker: opt-in persistent dbt/session.",
+        help="worker: persistent dbt session (default); process: one dbt invocation per query.",
     ),
 ]
 
@@ -79,7 +79,7 @@ def _request(
     profiles_dir: Path | None,
     dbt: Path | None,
     timeout: float,
-    backend: str = "process",
+    backend: str = "worker",
 ) -> QueryRequest:
     if str(file) == "[scratch]":
         raise EnhanceError(
@@ -137,7 +137,7 @@ def popup(
     profiles_dir: ProfilesOption = None,
     dbt: DbtOption = None,
     timeout: TimeoutOption = 120.0,
-    backend: BackendOption = Backend.process,
+    backend: BackendOption = Backend.worker,
 ) -> None:
     """Receive a selection on stdin and open a tmux popup (used by Helix)."""
     from dbt_enhance.popup import launch_popup
@@ -160,7 +160,7 @@ def query(
     profiles_dir: ProfilesOption = None,
     dbt: DbtOption = None,
     timeout: TimeoutOption = 120.0,
-    backend: BackendOption = Backend.process,
+    backend: BackendOption = Backend.worker,
 ) -> None:
     """Run a selection in this terminal; no tmux required. Never saves the buffer."""
     try:
@@ -267,7 +267,7 @@ def doctor(
             checks.append(("dbt", True, str(executable)))
             from dbt_enhance.worker import project_python, status
 
-            selected = os.environ.get("DBT_ENHANCE_BACKEND", "process")
+            selected = os.environ.get("DBT_ENHANCE_BACKEND", "worker")
             checks.append(("backend", selected in {"process", "worker"}, selected))
             if selected == "worker":
                 checks.append(("worker interpreter", True, str(project_python(executable))))

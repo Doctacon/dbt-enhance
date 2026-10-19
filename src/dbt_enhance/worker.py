@@ -534,18 +534,26 @@ def _open_worker(
         raise
 
 
+def _valid_watched(watched: Any) -> bool:
+    return (
+        isinstance(watched, list)
+        and len(watched) <= 128
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"path", "digest"}
+            and isinstance(item["path"], str)
+            and isinstance(item["digest"], str)
+            and _HEX64.fullmatch(item["digest"]) is not None
+            for item in watched
+        )
+    )
+
+
 def _watched_unchanged(record: dict[str, Any]) -> bool:
     from ._worker_helper import watch_files
 
     watched = record.get("watched", [])
-    if not isinstance(watched, list) or len(watched) > 128:
-        raise EnhanceError("Invalid worker credential-file state.")
-    if not all(
-        isinstance(item, dict)
-        and isinstance(item.get("path"), str)
-        and isinstance(item.get("digest"), str)
-        for item in watched
-    ):
+    if not _valid_watched(watched):
         raise EnhanceError("Invalid worker credential-file state.")
     return watch_files([item["path"] for item in watched], record["token"]) == watched
 
@@ -574,14 +582,14 @@ def run_query(
     record = None
     directory = None
     execution_sent = False
-    succeeded = False
+    session_reusable = False
     process = None
 
     def finish() -> None:
         if sock is not None:
             sock.close()
         if (
-            not succeeded
+            not session_reusable
             and record is not None
             and directory is not None
             and (execution_sent or process is not None)
@@ -650,6 +658,16 @@ def run_query(
                         _notify(on_status, SSO_STATUS)
                     continue
                 if kind == "error":
+                    if message.get("reusable") is True:
+                        watched = message.get("watched")
+                        if not _valid_watched(watched):
+                            raise EnhanceError("Worker returned malformed credential-file state.")
+                        if not isinstance(message.get("message"), str):
+                            raise EnhanceError("Worker returned a malformed query error.")
+                        record["watched"] = watched
+                        _write_state(directory / "control.json", record)
+                        deadline.remaining()
+                        session_reusable = True
                     detail = str(message.get("message", "Worker query failed."))[:8000]
                     if message.get("sso") or deadline.sso:
                         detail = SSO_GUIDANCE
@@ -663,7 +681,7 @@ def run_query(
                 _write_state(directory / "control.json", record)
                 deadline.remaining()
                 elapsed = time.monotonic() - started
-                succeeded = True
+                session_reusable = True
                 return QueryResult(
                     columns=result["columns"],
                     rows=result["rows"],

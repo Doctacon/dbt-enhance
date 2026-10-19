@@ -217,7 +217,7 @@ async def test_ui_timeout_survives_blocked_real_runner_cleanup(
         original_cleanup(process)  # type: ignore[arg-type]
 
     monkeypatch.setattr(dbt_backend, "_terminate_process_group", blocked_cleanup)
-    request = QueryRequest("select 1", source, dbt=executable, timeout=0.1)
+    request = QueryRequest("select 1", source, dbt=executable, timeout=0.1, backend="process")
     app = QueryApp(request, runner=dbt_backend.run_query)
     started = time.monotonic()
 
@@ -373,7 +373,8 @@ def test_quit_gives_real_dbt_time_to_kill_a_child_ignoring_sigterm(tmp_path) -> 
 
         async def main():
             request = QueryRequest('select 1', Path({str(project / "model.sql")!r}),
-                                   dbt=Path({str(executable)!r}), timeout=10)
+                                   dbt=Path({str(executable)!r}), timeout=10,
+                                   backend='process')
             app = QueryApp(request)
             async with app.run_test() as pilot:
                 for _ in range(200):

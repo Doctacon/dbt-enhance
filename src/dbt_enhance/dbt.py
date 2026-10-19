@@ -1,8 +1,7 @@
-"""Run dbt previews in an isolated subprocess.
+"""Dispatch dbt previews to a persistent worker or isolated subprocess.
 
-This module deliberately uses dbt's public command line rather than importing dbt
-Core.  Keeping dbt in a separate process isolates its global state and makes
-cancellation reliable.
+The worker backend is the default. The explicit process backend uses dbt's public
+command line, isolating its global state and making cancellation reliable.
 """
 
 from __future__ import annotations
@@ -111,9 +110,9 @@ def run_query(
 ) -> QueryResult:
     """Compile and execute one inline query with dbt Core.
 
-    All user-facing failures are raised as :class:`EnhanceError`.  The caller
-    can set ``cancel`` from another thread; the dbt process group is then
-    terminated without waiting for the configured query timeout.
+    All user-facing failures are raised as :class:`EnhanceError`. The request
+    selects either the default persistent worker or the explicit process backend.
+    The caller can set ``cancel`` from another thread to cancel active work.
     """
 
     _validate_request(request)

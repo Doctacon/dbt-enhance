@@ -55,7 +55,7 @@ under that name. See [releasing](docs/releasing.md).
   Helix's `editor.shell` is not supported by the generated mapping; your login
   shell can still be Fish.
 - An existing working **dbt Core** project with its warehouse adapter installed.
-  Tested with Core 1.10.22 and 1.12.6 plus dbt-duckdb 1.9.6. dbt Fusion and the dbt
+  Tested with Core 1.10.22, 1.12.5, and 1.12.6 plus dbt-duckdb 1.9.6. dbt Fusion and the dbt
   Cloud CLI are not supported.
 - Python 3.12+ for this tool; uv can provision Python. The project's dbt Python
   version is independent.
@@ -124,6 +124,7 @@ Optional overrides work for both `query` and the shortcut:
 | `--target` | `DBT_ENHANCE_TARGET` | dbt's default |
 | `--profiles-dir` | `DBT_ENHANCE_PROFILES_DIR` | dbt's normal discovery |
 | `--dbt` | `DBT_ENHANCE_DBT` | executable discovery above |
+| `--backend` | `DBT_ENHANCE_BACKEND` | `worker` (`process` for isolated queries) |
 
 For example: `DBT_ENHANCE_TARGET=dev DBT_ENHANCE_LIMIT=1000 hx models/orders.sql`.
 
@@ -229,20 +230,17 @@ To check timeout behavior, use `dbt-enhance query --file models/example.sql
 --sql 'select 1' --timeout 15`; the popup should show a timeout instead of spinning
 indefinitely, even when authentication has not completed.
 
-## Opt-in warm worker (experimental)
+## Warm worker (default)
 
-The default `process` backend still runs a fresh dbt command per selection.
-The `worker` backend keeps **both Python/dbt and the adapter's live connection**
+The default `worker` backend keeps **both Python/dbt and the adapter's live connection**
 open between queries. It uses dbt's own inline parsing, compilation, and
 adapter-dispatched preview SQL—not a handwritten `ref()`/`source()` resolver.
 
-Enable it before starting Helix/Yazi:
+No opt-in is needed, including in Helix/Yazi. To use a fresh dbt command per
+selection instead, set `DBT_ENHANCE_BACKEND=process` before starting your editor,
+or pass `--backend process` for one invocation.
 
-```sh
-export DBT_ENHANCE_BACKEND=worker
-```
-
-Or try it for one terminal query:
+For example:
 
 ```sh
 dbt-enhance query --backend worker --file /absolute/project/models/model.sql \
@@ -264,15 +262,20 @@ dbt-enhance query --backend worker --file /absolute/project/models/model.sql \
   temporary tables, can survive until retirement. Tracked transactions are rolled
   back between queries; this is not a sandbox for trusted macros or arbitrary
   session-setting changes.
-- Active-query errors, cancellation, and timeout retire the session. dbt-enhance
-  **never automatically replays** a failed/disconnected query; native adapter and
-  connector retry policies still apply. The next request starts fresh. Cancelling
+- Recognized SQL statement errors (such as syntax errors and missing tables) keep
+  the session and connection after successful rollback and request cleanup. Unknown,
+  connection/authentication, and cleanup failures, cancellation, and timeout retire
+  it; the next request then starts fresh. dbt-enhance **never automatically replays**
+  a failed/disconnected query; native adapter and connector retry policies still
+  apply. Cancelling
   while waiting for another query's lock does not interrupt that query. The popup's
   independent deadline remains active, and a separate supervisor can terminate
   the dbt process even if its Python thread is stuck.
-- This private-Core integration admits **Core 1.10.22 and 1.12.6 only**, with the
-  Snowflake/DuckDB adapters. Other releases require the same lifecycle checks before
-  admission. It requires a project Python 3.10+ and an ordinary
+- This private-Core integration admits stable **Core 1.10.x and 1.12.x** patches
+  (including **1.12.5**), with Snowflake/DuckDB adapters. Other minor lines,
+  prereleases, and suffixed builds are rejected. Required private APIs are still
+  checked at startup; admitting a minor line is not a claim that every patch has
+  been tested. It requires a project Python 3.10+ and an ordinary
   Python dbt console script; custom shell wrappers, unsupported versions/options,
   and eager `DBT_POPULATE_CACHE=true` must use `--backend process`. There is no
   silent fallback that could execute a selection twice.
@@ -291,10 +294,11 @@ OS user; credentials and selections are not placed in worker command arguments.
 The editor environment is inherited by the worker and remains in its memory for
 its lifetime. Project dbt logs/compiled files can still contain selected SQL.
 
-Local DuckDB tests cover both admitted Core versions: retained handle/temporary
+Local DuckDB tests cover representative patches of the admitted Core minors: retained handle/temporary
 objects, changing models/macros/sources, error recovery, cancellation, rollback,
 and physical connection closure. These are not live Snowflake measurements.
-The default stays `process` until real Snowflake/WSL validation is complete.
+Live Snowflake/WSL worker validation remains outstanding; use `--backend process`
+if your setup is unsupported or you need isolated per-query sessions.
 To verify actual Snowflake connection reuse, run `select current_session() as
 session_id` twice through worker mode with the same project/target/environment;
 compare the returned session IDs, not just the Python PID. Check cancellation,
@@ -388,8 +392,8 @@ uvx --from . dbt-enhance setup --force
   to an absolute executable path. Poetry/Conda environments can use this override.
 - **Profile/dependency/Jinja error:** the popup displays dbt's error. Check the
   same project's `dbt debug`, `dbt deps`, and selected SQL using its own dbt environment.
-- **Per-query startup:** the default process backend starts fresh even with a warm
-  partial-parse cache. Try the [opt-in worker](#opt-in-warm-worker-experimental)
+- **Per-query startup:** the explicit process backend starts fresh even with a warm
+  partial-parse cache. Use the [default worker](#warm-worker-default)
   to retain imports and a connection. Non-interactive authentication alone does
   not eliminate Python/dbt cold starts.
 - **Slow first parse:** subsequent previews can reuse the project's `partial_parse.msgpack`. The first run, a disabled
