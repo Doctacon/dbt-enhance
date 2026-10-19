@@ -94,8 +94,16 @@ persist, which is an intentional semantic difference from fresh CLI invocations.
 The UI's runner interface is unchanged. A per-project advisory lock serializes
 requests and is deadline/cancellation-aware. An opaque keyed project slot under a
 private runtime directory contains a random authentication token and generation
-fingerprint, not raw environment values. Configuration/environment/package changes
-retire the old worker before replacement. Native preflight reports the resolved
+fingerprint, not raw environment values. Worker identity and startup use the same
+normalized environment: shell bookkeeping (`_`, `OLDPWD`, `SHLVL`), popup terminal
+keys (`TERM`, `TERM_PROGRAM`, `TMUX`, `TMUX_PANE`, `LINES`, `COLUMNS`), and Yazi
+launch markers (`YAZI_ID`, `YAZI_LEVEL`) are excluded; `PWD` is the worker's project
+working directory. This does not alter the UI environment or the explicit process
+backend. All other variables remain significant because profiles/Jinja may depend
+on arbitrary names, not only DBT/Snowflake prefixes. Tests cover changed launch
+markers and the real popup handoff path; they do not establish live Yazi behavior.
+Configuration/environment/package changes retire the old worker before replacement
+and persist `configuration_changed` with its session PID. Native preflight reports the resolved
 profile path before reading it (including `.env` resolution); credential paths
 follow after configuration. First-read fingerprints are retained across both
 callbacks. Credential-file changes are watched;

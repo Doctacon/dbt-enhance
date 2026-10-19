@@ -258,6 +258,12 @@ dbt-enhance query --backend worker --file /absolute/project/models/model.sql \
   environment, profile, target, project configuration, credential files, or normal
   virtualenv package metadata restart it. After editing an installed or editable
   adapter's Python code directly, stop the worker explicitly.
+  Worker identity and startup share a normalized environment: `_`, `OLDPWD`,
+  `SHLVL`, terminal/tmux variables (`TERM`, `TERM_PROGRAM`, `TMUX`, `TMUX_PANE`,
+  `LINES`, `COLUMNS`), and Yazi's `YAZI_ID`/`YAZI_LEVEL` are removed; `PWD` is set
+  to the project directory. All other variables remain inputs, including custom
+  profile/Jinja credentials. Different PATHs, HOME values, or other real inputs
+  can therefore still require separate worker lifetimes.
 - An idle worker expires after **10 minutes**. Connection-local state, such as
   temporary tables, can survive until retirement. Tracked transactions are rolled
   back between queries; this is not a sandbox for trusted macros or arbitrary
@@ -292,6 +298,8 @@ dbt-enhance stop --file /absolute/project/models/model.sql
 `doctor` also reports the last recorded worker retirement, even after the next
 worker starts. Fatal worker responses store only an allowlisted reason code and
 session PID in `control.json` (`last_retirement`), never SQL or exception text.
+Configuration/environment/credential-driven replacements also record
+`configuration_changed` before restarting.
 For SQL-error recovery debugging, the codes distinguish `driver_error_missing`,
 `sqlstate_not_recoverable`, `connection_not_open`, `recovery_check_failed`, and
 `request_cleanup_failed`. This diagnostic describes the failed retention check;

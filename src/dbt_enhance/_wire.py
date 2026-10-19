@@ -32,6 +32,7 @@ RETIREMENT_REASONS = frozenset(
         "worker_failure",
         "timeout",
         "client_disconnect",
+        "configuration_changed",
     }
 )
 

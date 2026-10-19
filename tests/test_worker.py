@@ -188,6 +188,125 @@ def test_same_context_reuses_session_and_stop_closes_it(setup_worker):
     assert (project / f"closed-{first.rows[0][0]}").exists()
 
 
+def test_worker_environment_preserves_arbitrary_profile_inputs(tmp_path, monkeypatch):
+    source = {
+        "_": "/bin/hx",
+        "OLDPWD": "/previous",
+        "SHLVL": "3",
+        "PWD": "/caller",
+        "TERM": "xterm",
+        "TERM_PROGRAM": "test",
+        "TMUX": "test",
+        "TMUX_PANE": "%1",
+        "LINES": "50",
+        "COLUMNS": "100",
+        "YAZI_ID": "1",
+        "YAZI_LEVEL": "2",
+        "DBT_TARGET": "dev",
+        "DBT_ENHANCE_TARGET": "dev",
+        "SNOWFLAKE_ACCOUNT": "test",
+        "PATH": "/project/bin",
+        "HOME": "/test/home",
+        "AWS_SESSION_TOKEN": "synthetic",
+        "CUSTOM_PROFILE_PASSWORD": "synthetic",
+        "YAZI_CONFIG_HOME": "/test/yazi",
+    }
+    monkeypatch.setattr(os, "environ", source)
+    effective = worker._worker_environment(tmp_path)
+    assert effective["PWD"] == str(tmp_path)
+    for key in (
+        "_",
+        "OLDPWD",
+        "SHLVL",
+        "TERM",
+        "TERM_PROGRAM",
+        "TMUX",
+        "TMUX_PANE",
+        "LINES",
+        "COLUMNS",
+        "YAZI_ID",
+        "YAZI_LEVEL",
+    ):
+        assert key not in effective
+    for key in (
+        "DBT_TARGET",
+        "DBT_ENHANCE_TARGET",
+        "SNOWFLAKE_ACCOUNT",
+        "PATH",
+        "HOME",
+        "AWS_SESSION_TOKEN",
+        "CUSTOM_PROFILE_PASSWORD",
+        "YAZI_CONFIG_HOME",
+    ):
+        assert effective[key] == source[key]
+    assert source["PWD"] == "/caller"  # The caller's UI environment is unchanged.
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "_",
+        "OLDPWD",
+        "SHLVL",
+        "PWD",
+        "TERM",
+        "TERM_PROGRAM",
+        "TMUX",
+        "TMUX_PANE",
+        "LINES",
+        "COLUMNS",
+        "YAZI_ID",
+        "YAZI_LEVEL",
+    ],
+)
+def test_launcher_bookkeeping_does_not_restart_worker(setup_worker, monkeypatch, name):
+    project, request = setup_worker
+    monkeypatch.setenv(name, "first-launch")
+    before = worker.run_query(request)
+    monkeypatch.setenv(name, "second-launch")
+    after = worker.run_query(request)
+    assert after.rows[0][0] == before.rows[0][0]
+    assert after.rows[0][1] == 2
+    monkeypatch.delenv(name)
+    without_marker = worker.run_query(request)
+    assert without_marker.rows[0][0] == before.rows[0][0]
+    assert without_marker.rows[0][1] == 3
+    assert worker.retirement_status(project.resolve()) is None
+
+
+def test_terminal_and_popup_handoff_share_worker(setup_worker, monkeypatch, tmp_path):
+    from dbt_enhance.popup import read_request
+
+    # read_request replaces os.environ; isolate that operation from the test host.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    _, request = setup_worker
+    monkeypatch.setenv("TERM", "terminal-before-popup")
+    monkeypatch.setenv("_", "/bin/dbt-enhance")
+    before = worker.run_query(request)
+    editor_environment = dict(os.environ, SHLVL="3", OLDPWD="/previous", _="/bin/hx")
+    handoff = tmp_path / "request.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "sql": request.sql,
+                    "file": str(request.file),
+                    "dbt": str(request.dbt),
+                    "profiles_dir": str(request.profiles_dir),
+                    "backend": "worker",
+                },
+                "environment": editor_environment,
+            }
+        )
+    )
+    monkeypatch.setenv("TERM", "popup-terminal")
+    monkeypatch.setenv("TMUX_PANE", "%99")
+    popup_request = read_request(handoff)
+    after = worker.run_query(popup_request)
+    assert after.rows[0][0] == before.rows[0][0]
+    assert after.rows[0][1] == 2
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -233,6 +352,10 @@ def test_context_or_credentials_change_recycles_worker(setup_worker, monkeypatch
     assert before.rows[0][0] != after.rows[0][0]
     assert after.rows[0][1] == 1
     assert (project / f"closed-{before.rows[0][0]}").exists()
+    assert worker.retirement_status(project.resolve()) == {
+        "reason": "configuration_changed",
+        "session_pid": before.rows[0][0],
+    }
     if change == "environment":
         assert after.rows[0][2] == "changed"
 

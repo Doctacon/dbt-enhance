@@ -600,6 +600,33 @@ def _watched_unchanged(record: dict[str, Any]) -> bool:
     return watch_files([item["path"] for item in watched], record["token"]) == watched
 
 
+def _worker_environment(project: Path) -> dict[str, str]:
+    """Use one effective environment for both worker identity and execution.
+
+    Drop only launcher bookkeeping, not a prefix allowlist: profiles and Jinja
+    can depend on arbitrary environment variables, including credentials.
+    Terminal state belongs to the UI, not the detached dbt child.
+    """
+    environment = _child_environment()
+    for name in (
+        "_",
+        "OLDPWD",
+        "SHLVL",
+        "TERM",
+        "TERM_PROGRAM",
+        "TMUX",
+        "TMUX_PANE",
+        "LINES",
+        "COLUMNS",
+        "YAZI_ID",
+        "YAZI_LEVEL",
+    ):
+        environment.pop(name, None)
+    # Popen starts the worker in this directory, regardless of the caller's cwd.
+    environment["PWD"] = str(project)
+    return environment
+
+
 def run_query(
     request: QueryRequest,
     cancel: threading.Event | None = None,
@@ -612,7 +639,7 @@ def run_query(
     project = discover_project(request.file)
     dbt = find_dbt(project, request.dbt)
     interpreter = project_python(dbt)
-    environment = _child_environment()
+    environment = _worker_environment(project)
     context = {
         "project_dir": str(project),
         "target": request.target,
@@ -658,6 +685,8 @@ def run_query(
                 last_retirement = _valid_last_retirement(record.get("last_retirement"))
             if record and (record["generation"] != generation or not _watched_unchanged(record)):
                 _notify(on_status, "Restarting worker for changed configuration")
+                _persist_retirement(directory, record, "configuration_changed")
+                last_retirement = _valid_last_retirement(record.get("last_retirement"))
                 _stop_record(directory, record, min(2.0, deadline.remaining()))
                 record = None
             ready = decoder = None
