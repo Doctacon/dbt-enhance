@@ -85,8 +85,24 @@ yazi  # or: hx path/to/models/orders.sql
 | Page Up / Page Down | Scroll the focused view |
 | `s` | Expand/collapse compiled SQL |
 | `a` | Toggle selected-cell detail |
+| `y` | Copy the selected cell's full value |
+| Shift+`y` (`Y`) | Copy all compiled SQL (even when the SQL panel is closed) |
 | Tab / Shift-Tab | Move focus between visible panels |
 | `q` / Esc | Close; cancel the local dbt process if still running |
+
+Copy shortcuts use the original text, including off-screen content, tabs, and
+newlines—not the shortened table/detail display. NULL copies as `NULL`, booleans
+as `true`/`false`; empty strings leave the clipboard unchanged with a notice.
+Local macOS sessions use `pbcopy`, including in Terminal.app. Otherwise, in a
+popup, copying saves a tmux paste buffer and asks tmux to forward it to your
+terminal's system clipboard. This works with tmux's default `set-clipboard external`;
+your terminal must also allow OSC 52 clipboard writes. Outside tmux, the viewer
+sends OSC 52 directly. If system paste remains unchanged (for example, SSH from
+Terminal.app, which lacks OSC 52), check your terminal's clipboard support and
+permissions. When using the tmux route, the full buffer is also available via
+`tmux save-buffer -` or tmux's paste-buffer binding after closing the popup.
+Mouse dragging is handled by the viewer; use these shortcuts to copy full values
+rather than relying on terminal text selection.
 
 The default is **500 rows** and a **120-second local timeout**. The table is a
 preview, not pagination over the whole result. A result exactly at the limit may

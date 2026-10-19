@@ -5,6 +5,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -14,6 +15,13 @@ from textual.widgets import DataTable
 from dbt_enhance import dbt as dbt_backend
 from dbt_enhance.models import SSO_STATUS, EnhanceError, QueryRequest, QueryResult
 from dbt_enhance.ui import QueryApp
+
+
+@pytest.fixture(autouse=True)
+def no_host_clipboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Headless tests must never overwrite the developer's system clipboard.
+    monkeypatch.setattr("dbt_enhance.ui.platform", "linux")
+    monkeypatch.delenv("TMUX", raising=False)
 
 
 def result(rows: list[list[object]] | None = None) -> QueryResult:
@@ -41,6 +49,152 @@ async def test_success_renders_literal_values_and_detail() -> None:
         await pilot.press("l", "a")
         assert app.query_one("#detail-panel").display
         assert "�" in app.query_one("#detail").renderable.plain
+
+
+@pytest.mark.asyncio
+async def test_copy_all_sql_including_offscreen_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    query = replace(
+        result(), compiled_sql="select '↵', '⇥'\n" + ("-- filler\n" * 1_000) + "-- SQL TAIL"
+    )
+    app = QueryApp(result=query)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("s", "tab", "pagedown", "Y")
+        assert app.focused is app.query_one("#sql-panel")
+        assert app.clipboard == query.compiled_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("[literal]\tline\n" + "long value " * 1_000, "[literal]\tline\n" + "long value " * 1_000),
+        (None, "NULL"),
+        (True, "true"),
+        (False, "false"),
+        (123, "123"),
+    ],
+    ids=["long-multiline", "null", "true", "false", "number"],
+)
+async def test_copy_selected_cell_without_display_truncation(
+    monkeypatch: pytest.MonkeyPatch, value: object, expected: str
+) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    app = QueryApp(result=result([[1, value, None]]))
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.copy_to_clipboard("previous clipboard")
+        await pilot.press("l", "a", "y")
+        assert app.clipboard == expected
+
+
+@pytest.mark.asyncio
+async def test_copy_uses_tmux_stdin_for_full_sql_and_cell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TMUX", "/tmp/test-tmux,1,0")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object) -> None:
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr("dbt_enhance.ui.subprocess.run", run)
+    query = result([[1, "quoted '雪'\tvalue\n" + "x" * 10_000, None]])
+    app = QueryApp(result=query)
+    async with app.run_test() as pilot:
+        await pilot.press("s", "Y", "l", "y")
+    assert len(calls) == 2
+    for (command, kwargs), expected in zip(
+        calls, [query.compiled_sql, query.rows[0][1]], strict=True
+    ):
+        assert command == ["tmux", "load-buffer", "-w", "-"]
+        assert kwargs == {
+            "input": expected.encode("utf-8"),
+            "capture_output": True,
+            "check": True,
+            "timeout": 2,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError(),
+        subprocess.CalledProcessError(1, "tmux"),
+        subprocess.TimeoutExpired("tmux", 2),
+    ],
+    ids=["missing", "failed", "timeout"],
+)
+async def test_copy_failure_is_reported_without_closing_popup(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setenv("TMUX", "/tmp/test-tmux,1,0")
+
+    def run(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr("dbt_enhance.ui.subprocess.run", run)
+    app = QueryApp(result=result())
+    notices: list[str] = []
+    monkeypatch.setattr(app, "notify", lambda message, **kwargs: notices.append(message))
+    async with app.run_test() as pilot:
+        await pilot.press("y", "l")
+        assert app.query_one("#results", DataTable).cursor_coordinate.column == 1
+        assert notices == ["Could not copy to clipboard. Try again."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "ssh"])
+async def test_macos_copy_uses_native_clipboard_only_locally(
+    monkeypatch: pytest.MonkeyPatch, remote: bool
+) -> None:
+    monkeypatch.setattr("dbt_enhance.ui.platform", "darwin")
+    monkeypatch.setenv("TMUX", "/tmp/test-tmux,1,0")
+    for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+        monkeypatch.delenv(key, raising=False)
+    if remote:
+        monkeypatch.setenv("SSH_CONNECTION", "192.0.2.1 1234 192.0.2.2 22")
+    calls: list[tuple[list[str], object]] = []
+
+    def run(command: list[str], **kwargs: object) -> None:
+        calls.append((command, kwargs["input"]))
+
+    monkeypatch.setattr("dbt_enhance.ui.subprocess.run", run)
+    query = result()
+    app = QueryApp(result=query)
+    async with app.run_test() as pilot:
+        await pilot.press("Y")
+    command = ["tmux", "load-buffer", "-w", "-"] if remote else ["/usr/bin/pbcopy"]
+    assert calls == [(command, query.compiled_sql.encode("utf-8"))]
+
+
+@pytest.mark.asyncio
+async def test_copy_empty_cell_reports_unchanged_clipboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QueryApp(result=result([["", None, None]]))
+    notices: list[str] = []
+    monkeypatch.setattr(app, "notify", lambda message, **kwargs: notices.append(message))
+    async with app.run_test() as pilot:
+        app.copy_to_clipboard("previous")
+        await pilot.press("y")
+        assert app.clipboard == "previous"
+        assert notices == ["Cell is empty; clipboard unchanged."]
+
+
+@pytest.mark.asyncio
+async def test_copy_empty_result_leaves_clipboard_alone_but_sql_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    query = result([])
+    app = QueryApp(result=query)
+    async with app.run_test() as pilot:
+        app.copy_to_clipboard("previous")
+        await pilot.press("y")
+        assert app.clipboard == "previous"
+        await pilot.press("Y")
+        assert app.clipboard == query.compiled_sql
 
 
 @pytest.mark.asyncio

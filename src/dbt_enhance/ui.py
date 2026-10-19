@@ -6,11 +6,15 @@ in a worker thread, while the UI only receives progress and final state updates.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import math
+import os
 import re
+import subprocess
 import time
 from pathlib import Path
+from sys import platform
 from threading import Event, Thread
 from typing import ClassVar
 
@@ -142,6 +146,8 @@ class QueryApp(App[None]):
         Binding("escape", "quit", "Close"),
         Binding("s", "toggle_sql", "SQL"),
         Binding("a", "toggle_detail", "Cell detail"),
+        Binding("y", "copy_cell", "Copy cell"),
+        Binding("Y", "copy_sql", "Copy SQL"),
         Binding("h", "table_left", show=False),
         Binding("j", "table_down", show=False),
         Binding("k", "table_up", show=False),
@@ -194,7 +200,7 @@ class QueryApp(App[None]):
             ScrollPanel(Static("", id="sql"), id="sql-panel"),
             DataTable(id="results", cursor_type="cell", zebra_stripes=True),
             ScrollPanel(Static("", id="detail"), id="detail-panel"),
-            Static("s SQL  ·  a detail  ·  Tab panels  ·  q close", id="help"),
+            Static("s SQL · a detail · y cell · Y copy SQL · Tab panels · q close", id="help"),
             id="shell",
         )
 
@@ -435,7 +441,72 @@ class QueryApp(App[None]):
         panel = self.query_one("#sql-panel", ScrollPanel)
         panel.display = self._sql_open
         if self._sql_open:
-            panel.border_title = " Compiled SQL · s to close "
+            panel.border_title = " Compiled SQL · Y copy all · s close "
+
+    async def _copy_text(self, text: str, label: str) -> None:
+        """Send full source text, not the truncated/sanitized renderable."""
+        if not text:
+            # tmux load-buffer accepts empty stdin but leaves the old buffer intact.
+            self.notify(f"{label} is empty; clipboard unchanged.")
+            return
+        if platform == "darwin" and not any(
+            os.environ.get(key) for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+        ):
+            # Terminal.app has no OSC 52 support. Only use the native clipboard
+            # locally: over SSH the destination is the user's terminal, not this host.
+            command = ["/usr/bin/pbcopy"]
+            success = f"{label} copied to clipboard."
+        elif os.environ.get("TMUX"):
+            # Textual's OSC 52 is ignored by tmux's default set-clipboard=external.
+            command = ["tmux", "load-buffer", "-w", "-"]
+            success = f"{label} saved to tmux buffer; terminal clipboard requested."
+        else:
+            self.copy_to_clipboard(text)
+            self.notify(f"{label} sent to terminal clipboard.")
+            return
+        # stdin keeps query data out of process arguments; a thread keeps rendering
+        # responsive, and the timeout bounds a stalled clipboard process.
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                command,
+                input=text.encode("utf-8"),
+                capture_output=True,
+                check=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.notify("Could not copy to clipboard. Try again.", severity="error")
+            return
+        self.notify(success)
+
+    async def action_copy_sql(self) -> None:
+        if self._result is None:
+            self.notify("No compiled SQL to copy yet.", severity="warning")
+            return
+        await self._copy_text(self._result.compiled_sql, "Compiled SQL")
+
+    async def action_copy_cell(self) -> None:
+        table = self.query_one("#results", DataTable)
+        row, column = table.cursor_coordinate
+        if self._result is None or not (
+            0 <= row < len(self._rows) and 0 <= column < len(self._result.columns)
+        ):
+            self.notify("No result cell to copy.", severity="warning")
+            return
+        values = self._rows[row]
+        value = values[column] if column < len(values) else None
+        try:
+            if value is None:
+                text = "NULL"
+            elif isinstance(value, bool):
+                text = str(value).lower()
+            else:
+                text = str(value)
+        except Exception:  # noqa: BLE001 - warehouse values can have broken __str__
+            self.notify("Could not convert this cell to text.", severity="error")
+            return
+        await self._copy_text(text, "Cell")
 
     def action_toggle_detail(self) -> None:
         table = self.query_one("#results", DataTable)
