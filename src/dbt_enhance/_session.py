@@ -43,7 +43,7 @@ class SessionError(RuntimeError):
 
 
 class QueryError(RuntimeError):
-    """A scrubbed SQL error after successful cleanup; the session is reusable."""
+    """A scrubbed query/compile error after cleanup; the session is reusable."""
 
 
 def _core_version() -> str:
@@ -64,10 +64,12 @@ def _require_symbols() -> None:
 
     required = {
         "dbt.adapters.contracts.connection": ("ConnectionState",),
-        "dbt.adapters.factory": ("get_adapter", "reset_adapters"),
+        "dbt.adapters.factory": ("get_adapter", "register_adapter", "reset_adapters"),
         "dbt.cli.flags": ("Flags", "args_to_context"),
         "dbt.cli.requires": ("preflight", "profile", "project", "runtime_config", "setup_manifest"),
+        "dbt.exceptions": ("ParsingError",),
         "dbt.flags": ("set_flags",),
+        "dbt.mp_context": ("get_mp_context",),
         "dbt.parser.manifest": ("ManifestLoader",),
         "dbt.task.show": ("ShowTask",),
         "dbt.tracking": ("initialize_from_flags",),
@@ -75,7 +77,12 @@ def _require_symbols() -> None:
         "dbt_common.context": ("set_invocation_context",),
         "dbt_common.events.contextvars": ("log_contextvars", "task_contextvars"),
         "dbt_common.events.event_manager_client": ("get_event_manager",),
-        "dbt_common.exceptions": ("env_secrets", "scrub_secrets"),
+        "dbt_common.exceptions": (
+            "CompilationError",
+            "DbtBaseException",
+            "env_secrets",
+            "scrub_secrets",
+        ),
         "dbt_common.invocation": ("reset_invocation_id",),
     }
     try:
@@ -314,28 +321,34 @@ class DbtSession:
         if self._on_config is not None:
             self._on_config(self._credential_paths())
 
-        requires.setup_manifest(ctx, write=False)
-        self._manifest = ctx.obj["manifest"]
-        self._adapter = importlib.import_module("dbt.adapters.factory").get_adapter(self._config)
+        # Bootstrap the adapter separately from parsing. A bad model on the
+        # first request must not force another Click/config/adapter lifecycle.
+        factory = importlib.import_module("dbt.adapters.factory")
+        mp_context = importlib.import_module("dbt.mp_context").get_mp_context()
+        factory.register_adapter(self._config, mp_context)
+        self._adapter = factory.get_adapter(self._config)
         self._initialized = True
 
     def _prepare_request(self, sql: str, limit: int) -> None:
         if not self._initialized:
             self._initialize(sql, limit)
-            return
-
-        flags = self._new_flags(sql, limit)
-        bad_flags = self._unsupported_flags(flags)
-        if bad_flags:
-            raise UnsupportedSession(
-                "Persistent dbt sessions do not support "
-                + ", ".join(bad_flags)
-                + ". Use the process backend instead."
-            )
-        self._reset_invocation(flags)
+        else:
+            flags = self._new_flags(sql, limit)
+            bad_flags = self._unsupported_flags(flags)
+            if bad_flags:
+                raise UnsupportedSession(
+                    "Persistent dbt sessions do not support "
+                    + ", ".join(bad_flags)
+                    + ". Use the process backend instead."
+                )
+            self._reset_invocation(flags)
         self._adapter.cache.clear()
-        loader = importlib.import_module("dbt.parser.manifest").ManifestLoader
-        self._manifest = loader.get_full_manifest(self._config, reset=True)
+        if self._manifest is None:
+            importlib.import_module("dbt.cli.requires").setup_manifest(self._ctx, write=False)
+            self._manifest = self._ctx.obj["manifest"]
+        else:
+            loader = importlib.import_module("dbt.parser.manifest").ManifestLoader
+            self._manifest = loader.get_full_manifest(self._config, reset=True)
 
     def _rollback_open_transaction(self) -> None:
         if self._adapter is None:
@@ -362,6 +375,40 @@ class DbtSession:
         if self._config.credentials.type == "snowflake":
             return not connection.handle.is_closed()
         return True
+
+    def _connection_can_compile(self) -> bool:
+        """Compile failures may precede opening any connection; don't open one here."""
+        connection = self._adapter.connections.get_if_exists()
+        state = importlib.import_module("dbt.adapters.contracts.connection").ConnectionState
+        if connection is None or connection.state == state.INIT:
+            return True
+        return self._connection_is_open()
+
+    @staticmethod
+    def _is_compilation_error(error: Exception) -> bool:
+        exceptions = importlib.import_module("dbt_common.exceptions")
+        parsing = importlib.import_module("dbt.exceptions").ParsingError
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, (exceptions.CompilationError, parsing)):
+                return True
+            # Core's inline parser raises a plain DbtBaseException with the
+            # CompilationError in __context__. Do not unwrap arbitrary fatal
+            # errors that merely occurred while handling a compilation error.
+            if type(current) is not exceptions.DbtBaseException:
+                return False
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _discard_manifest(self) -> None:
+        # Inline setup can fail before it publishes _inline_node_id. Dropping
+        # the whole graph also removes any partial nodes, refs, and macro state.
+        self._manifest = None
+        self._ctx.obj.pop("manifest", None)
+        self._config.clear_dependencies()
+        self._adapter.clear_macro_resolver()
 
     def _is_query_error(self, error: Exception) -> bool:
         return self._query_error_reason(error) is None
@@ -440,6 +487,8 @@ class DbtSession:
         runner: Any = None
         completed = False
         recoverable = False
+        compilation_failure = False
+        compiling = True
         message = ""
         try:
             self._prepare_request(prepared_sql, limit)
@@ -460,6 +509,7 @@ class DbtSession:
                     ):
                         runner = task.get_runner(node)
                         compiled = runner.compile(self._manifest)
+                        compiling = False
                         result = runner.execute(compiled, self._manifest)
 
             columns, rows = self._table_result(result.agate_table)
@@ -474,7 +524,12 @@ class DbtSession:
         except Exception as error:
             message = _scrub_error(error)
             try:
-                if not self._initialized or runner is None:
+                compilation_failure = (
+                    self._initialized and compiling and self._is_compilation_error(error)
+                )
+                if compilation_failure:
+                    reason = None if self._connection_can_compile() else "connection_not_open"
+                elif not self._initialized or runner is None:
                     reason = "request_setup_failed"
                 else:
                     reason = self._query_error_reason(error)
@@ -504,8 +559,14 @@ class DbtSession:
                 selected = importlib.import_module("dbt.selected_resources")
                 selected.set_selected_resources(set())
                 self._rollback_open_transaction()
-                if recoverable and not self._connection_is_open():
-                    raise SessionError("dbt connection closed during query cleanup")
+                if recoverable:
+                    if compilation_failure:
+                        self._discard_manifest()
+                        healthy = self._connection_can_compile()
+                    else:
+                        healthy = self._connection_is_open()
+                    if not healthy:
+                        raise SessionError("dbt connection closed during query cleanup")
             except Exception as cleanup_error:
                 # A recoverable SQL error is only reusable after *all* cleanup
                 # succeeds. Keep the original query error if cleanup also fails.

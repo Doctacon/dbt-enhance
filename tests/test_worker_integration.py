@@ -161,7 +161,16 @@ def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch, faile
     assert worker.status(project.resolve())["session_pid"] != before
 
 
-@pytest.mark.parametrize("bad_sql", ["select * from missing_test_table", "select from"])
+@pytest.mark.parametrize(
+    "bad_sql",
+    [
+        "select * from missing_test_table",
+        "select from",
+        "select * from {{ ref('missing_branch_model') }}",
+        "select {{ missing_branch_macro() }}",
+        "select {{ broken_jinja",
+    ],
+)
 def test_real_worker_query_error_keeps_session_and_connection(native_worker, bad_sql):
     project, request = native_worker
     run_query(
@@ -177,6 +186,34 @@ def test_real_worker_query_error_keeps_session_and_connection(native_worker, bad
     recovered = run_query(replace(request, sql="select * from kept_after_error"))
     assert recovered.rows == [[73]]
     assert worker.status(project.resolve())["session_pid"] == before
+
+
+def test_real_worker_recovers_after_project_parse_error(native_worker):
+    project, request = native_worker
+    run_query(
+        replace(
+            request,
+            sql="{% do run_query('create temp table kept_after_parse as select 73 as marker') %} "
+            "select 1 as value",
+        )
+    )
+    before = worker.status(project.resolve())["session_pid"]
+    # Simulate switching branches to a model with a missing dependency.
+    model = project / "models" / "branch_model.sql"
+    model.write_text("select * from {{ ref('missing_on_branch') }}")
+    with pytest.raises(EnhanceError, match="missing_on_branch"):
+        run_query(request)
+    assert worker.status(project.resolve())["session_pid"] == before
+    model.write_text("{{ config(materialized='ephemeral') }} select 8 as value")
+    recovered = run_query(
+        replace(
+            request,
+            sql="select value, marker from {{ ref('branch_model') }} cross join kept_after_parse",
+        )
+    )
+    assert recovered.rows == [[8, 73]]
+    assert worker.status(project.resolve())["session_pid"] == before
+    assert worker.retirement_status(project.resolve()) is None
 
 
 def test_real_worker_timeout_kills_active_session_and_allows_restart(native_worker):

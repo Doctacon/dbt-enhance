@@ -97,8 +97,10 @@ Core **1.12.5**. The regression suite covers:
   fresh invocation IDs/times, preview limits, and empty-result columns.
 - The identical retained adapter handle and a surviving connection-local temporary
   table, including a series of repeated requests.
-- Recognized SQL statement errors retain the session and temporary objects after
-  successful rollback and cleanup. Unknown/internal, connection/authentication,
+- Recognized SQL statement errors and pre-execution native compilation/parse errors
+  retain the session after successful rollback and cleanup. Failed manifests are
+  discarded and reparsed; cold parse failures do not open a connection. Warm
+  failures preserve the handle and temporary objects. Unknown/internal, connection/authentication,
   cleanup, and output-cap failures still retire it. No failed query is replayed.
 - Tracked transactions roll back, explicit close is idempotent, the native
   connection is marked closed, and **another process can open the same writable

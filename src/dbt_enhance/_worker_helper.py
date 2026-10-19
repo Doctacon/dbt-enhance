@@ -356,7 +356,7 @@ def _session_main(fd_text: str) -> int:
                 result = dbt_session.execute(sql, limit)
             except session_module.QueryError as error:
                 # QueryError means dbt completed rollback/request cleanup and
-                # verified that the native connection remains usable. Preserve
+                # verified that the native session remains usable. Preserve
                 # any credential baselines discovered by the failed request.
                 _child_send(
                     sock,

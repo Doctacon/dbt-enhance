@@ -69,6 +69,61 @@ def test_snowflake_error_classification(tmp_path, monkeypatch, sqlstate, expecte
     assert session._query_error_reason(error) == (None if expected else "sqlstate_not_recoverable")
 
 
+def test_compilation_errors_exclude_configuration_database_and_internal_errors():
+    from dbt.exceptions import ParsingError, TargetNotFoundError
+    from dbt_common.exceptions import (
+        CompilationError,
+        DbtConfigError,
+        DbtDatabaseError,
+        DbtRuntimeError,
+    )
+
+    assert issubclass(TargetNotFoundError, CompilationError)
+    for error in (CompilationError("invalid Jinja"), ParsingError("invalid project model")):
+        assert DbtSession._is_compilation_error(error)
+    for error in (
+        DbtConfigError("invalid credentials"),
+        DbtDatabaseError("connection lost"),
+        DbtRuntimeError("unknown failure"),
+        ValueError("internal bug"),
+    ):
+        assert not DbtSession._is_compilation_error(error)
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_inline_parser_wrapper_preserves_compile_error_classification(link):
+    from dbt_common.exceptions import CompilationError, DbtBaseException, DbtDatabaseError
+
+    wrapped = DbtBaseException("Error parsing inline query")
+    setattr(wrapped, link, CompilationError("missing ref"))
+    assert DbtSession._is_compilation_error(wrapped)
+    for fatal in (DbtDatabaseError("connection lost"), ValueError("internal failure")):
+        setattr(fatal, link, wrapped)
+        assert not DbtSession._is_compilation_error(fatal)
+    other = DbtBaseException("unknown wrapper")
+    setattr(wrapped, link, other)
+    setattr(other, link, wrapped)
+    assert not DbtSession._is_compilation_error(wrapped)
+
+
+@pytest.mark.parametrize("state_name,allowed", [("INIT", True), ("CLOSED", False), ("FAIL", False)])
+def test_compile_recovery_never_opens_a_connection(tmp_path, state_name, allowed):
+    from dbt.adapters.contracts.connection import ConnectionState
+
+    class Connection:
+        state = getattr(ConnectionState, state_name)
+
+        @property
+        def handle(self):
+            raise AssertionError("must not resolve a lazy/closed handle")
+
+    session = DbtSession({"project_dir": str(tmp_path)})
+    session._adapter = SimpleNamespace(connections=SimpleNamespace(get_if_exists=Connection))
+    assert session._connection_can_compile() is allowed
+    session._adapter.connections.get_if_exists = lambda: None
+    assert session._connection_can_compile()
+
+
 def test_closed_connection_does_not_resolve_lazy_handle(tmp_path):
     from dbt.adapters.contracts.connection import ConnectionState
 

@@ -356,6 +356,79 @@ def test_first_query_error_recovers_but_cleanup_failure_retires(tmp_path: Path) 
     assert completed.returncode == 0, completed.stderr + completed.stdout
 
 
+@pytest.mark.integration
+def test_parse_recovery_before_connection_and_manifest_cleanup_failure(tmp_path: Path) -> None:
+    project, profiles = _project(tmp_path)
+    completed = _run_child(
+        project,
+        profiles,
+        r"""
+        session = DbtSession(context)
+        broken_model = project / "models/branch_model.sql"
+        for contents in (
+            "select * from {{ ref('missing_branch_model') }}",
+            "select {{ broken_jinja",
+        ):
+            broken_model.write_text(contents)
+            try:
+                session.execute("select 1", 2)
+            except QueryError:
+                pass
+            else:
+                raise AssertionError("invalid project unexpectedly parsed")
+            assert not session._closed
+            assert session._manifest is None
+            assert "manifest" not in session._ctx.obj
+            connection = session._adapter.connections.get_if_exists()
+            from dbt.adapters.contracts.connection import ConnectionState
+            assert connection is None or connection.state == ConnectionState.INIT
+        adapter = session._adapter
+        broken_model.write_text("{{ config(materialized='ephemeral') }} select 8 as value")
+        for bad_sql in (
+            "select * from {{ ref('missing_branch_model') }}",
+            "select {{ missing_branch_macro() }}",
+            "select {{ broken_jinja",
+        ):
+            try:
+                session.execute(bad_sql, 2)
+            except QueryError:
+                pass
+            else:
+                raise AssertionError("invalid inline SQL unexpectedly compiled")
+            assert session._adapter is adapter
+            connection = adapter.connections.get_if_exists()
+            assert connection is None or connection.state == ConnectionState.INIT
+        assert session.execute("select * from {{ ref('branch_model') }}", 2)["rows"] == [[8]]
+        assert session._adapter is adapter
+        connection = adapter.connections.get_thread_connection()
+        handle = connection.handle
+        adapter.connections.begin()
+        try:
+            session.execute("select * from {{ ref('missing_model') }}", 2)
+        except QueryError:
+            pass
+        else:
+            raise AssertionError("invalid ref unexpectedly compiled")
+        assert not connection.transaction_open
+        assert connection.handle is handle
+        assert session.execute("select 9", 2)["rows"] == [[9]]
+        assert connection.handle is handle
+        def broken_discard():
+            raise RuntimeError("synthetic manifest cleanup failure")
+        session._discard_manifest = broken_discard
+        try:
+            session.execute("select * from {{ ref('missing_model') }}", 2)
+        except SessionError as error:
+            assert error.reason == "request_cleanup_failed"
+        else:
+            raise AssertionError("manifest cleanup failure must retire")
+        assert session._closed
+        session.close()
+        """,
+    )
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+
+
 def test_compatibility_does_not_read_profiles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

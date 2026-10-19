@@ -114,7 +114,15 @@ The supervisor, not dbt's execution thread, enforces the accepted request timeou
 and observes client disconnects. Recognized driver statement errors retain the
 session only after successful rollback/request cleanup and an open-connection
 check. DuckDB parser/binder/catalog/conversion/range/constraint errors and Snowflake
-ProgrammingError SQLSTATE classes 22, 23, and 42 are recoverable. Other failures,
+ProgrammingError SQLSTATE classes 22, 23, and 42 are recoverable. Native compilation
+and parsing errors before query execution are also recoverable after adapter/config
+bootstrap, including Core's plain `DbtBaseException` inline-parser wrapper. Recovery
+is deliberately not inferred through arbitrary fatal exception wrappers. Failed
+compilation drops the manifest from both the session and Click context, clears
+dependency/macro-resolution state, and rebuilds on the next request. A missing or
+INIT connection is safe for this path and is never opened just to check health;
+an existing connection must remain healthy. Profile/bootstrap errors still retire.
+Other failures,
 cancellation, malformed execution transport, or uncertain disconnect retire the
 session; there is no automatic query replay. Recoverable errors carry the same
 credential-file snapshots as successes, including a failed first request. The
@@ -233,8 +241,8 @@ user profiles and clear inherited artifact-path overrides before local testing.
 
 `tests/test_snowflake_session.py` exercises native parsing, compilation, and the
 real Snowflake adapter's exception handler using a synthetic connector handle.
-It covers SQLSTATE 42S02, 42000, and 22012, plus closed-handle, health-check, and
-cleanup failures. Run it with `uv run --with dbt-snowflake python -m pytest
+It covers SQLSTATE 42S02, 42000, and 22012, cold/warm missing-ref and Jinja errors,
+plus closed-handle, health-check, and cleanup failures. Run it with `uv run --with dbt-snowflake python -m pytest
 tests/test_snowflake_session.py`. This is offline adapter-path coverage, not proof
 of live Snowflake connector/session retention. A live report of retirement after
 these SQL errors still requires the retirement reason and installed adapter/

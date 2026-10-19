@@ -34,6 +34,11 @@ def test_snowflake_native_query_error_preserves_handle(tmp_path, sqlstate, gate,
       schema: offline_test
       threads: 1
 """)
+    compile_errors = (
+        "select * from {{ ref('missing_branch_model') }}",
+        "select {{ missing_branch_macro() }}",
+        "select {{ broken_jinja",
+    )
     completed = _run_child(
         project,
         profiles,
@@ -75,8 +80,22 @@ def connect(**kwargs):
     return handle
 snowflake.connector.connect = connect
 session = DbtSession(context)
+def check_compile_errors():
+    for sql in {compile_errors!r}:
+        try:
+            session.execute(sql, 2)
+        except QueryError:
+            pass
+        else:
+            raise AssertionError("expected recoverable compilation error")
 try:
+    if {gate!r} == "healthy":
+        check_compile_errors()
+        assert not handles  # Failed compilation must not authenticate/connect.
     assert session.execute("select 1 as value", 2)["rows"] == [[1]]
+    if {gate!r} == "healthy":
+        check_compile_errors()
+        assert len(handles) == 1 and not handles[0].closed
     def failed_check():
         raise RuntimeError("synthetic failure with private detail")
     if {gate!r} == "probe":

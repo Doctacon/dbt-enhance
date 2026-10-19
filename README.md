@@ -268,9 +268,14 @@ dbt-enhance query --backend worker --file /absolute/project/models/model.sql \
   temporary tables, can survive until retirement. Tracked transactions are rolled
   back between queries; this is not a sandbox for trusted macros or arbitrary
   session-setting changes.
-- Recognized SQL statement errors (such as syntax errors and missing tables) keep
-  the session and connection after successful rollback and request cleanup. Unknown,
-  connection/authentication, and cleanup failures, cancellation, and timeout retire
+- Recognized SQL statement errors (such as syntax errors and missing tables), plus
+  native Jinja/compilation and model-parse errors (such as a missing `ref()` after
+  a branch switch), keep the session after successful rollback and cleanup.
+  Failed compilation discards its manifest and macro-resolution state; the next
+  request reparses the corrected project without reopening a healthy connection.
+  Compile failures before the first query do not force a connection to open.
+  Invalid profile/bootstrap configuration, unknown errors,
+  connection/authentication and cleanup failures, cancellation, and timeout retire
   it; the next request then starts fresh. dbt-enhance **never automatically replays**
   a failed/disconnected query; native adapter and connector retry policies still
   apply. Cancelling
