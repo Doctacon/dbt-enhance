@@ -16,6 +16,30 @@ MAX_REQUEST = 8 * 1024 * 1024  # JSON escaping can expand a 1 MiB SQL selection 
 MAX_SQL = 1024 * 1024
 IDLE_SECONDS = 600.0
 
+# Retirement diagnostics are persisted across worker replacement. Keep this
+# deliberately closed: protocol peers must never turn exception text, SQL, or
+# adapter-provided values into durable state.
+RETIREMENT_REASONS = frozenset(
+    {
+        "request_setup_failed",
+        "non_dbt_error",
+        "driver_error_missing",
+        "sqlstate_not_recoverable",
+        "connection_not_open",
+        "recovery_check_failed",
+        "request_cleanup_failed",
+        "session_error",
+        "worker_failure",
+        "timeout",
+        "client_disconnect",
+    }
+)
+
+
+def validate_retirement_reason(value: object) -> str | None:
+    """Return only a fixed, non-sensitive retirement reason code."""
+    return value if isinstance(value, str) and value in RETIREMENT_REASONS else None
+
 
 class WireError(Exception):
     """Invalid, incomplete, or oversized worker transport (never include its data)."""

@@ -1,4 +1,5 @@
 """Recovery boundaries: statement errors are not transport/internal failures."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -22,12 +23,26 @@ def test_duckdb_error_classification(tmp_path):
         assert not session._is_query_error(error)
     assert not session._is_query_error(DbtRuntimeError("unknown dbt failure"))
     assert not session._is_query_error(ValueError("internal failure"))
+    assert (
+        session._query_error_reason(DbtRuntimeError("unknown dbt failure"))
+        == "driver_error_missing"
+    )
+    assert session._query_error_reason(ValueError("internal failure")) == "non_dbt_error"
 
 
-@pytest.mark.parametrize("sqlstate,expected", [
-    ("42000", True), ("42S02", True), ("22000", True), ("23000", True),
-    ("08003", False), ("28000", False), ("58000", False), (None, False),
-])
+@pytest.mark.parametrize(
+    "sqlstate,expected",
+    [
+        ("42000", True),
+        ("42S02", True),
+        ("22000", True),
+        ("23000", True),
+        ("08003", False),
+        ("28000", False),
+        ("58000", False),
+        (None, False),
+    ],
+)
 def test_snowflake_error_classification(tmp_path, monkeypatch, sqlstate, expected):
     import sys
 
@@ -37,9 +52,13 @@ def test_snowflake_error_classification(tmp_path, monkeypatch, sqlstate, expecte
         pass
 
     # Match Snowflake adapter's implicit exception context, without credentials.
-    monkeypatch.setitem(sys.modules, "snowflake.connector.errors", SimpleNamespace(
-        ProgrammingError=ProgrammingError,
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "snowflake.connector.errors",
+        SimpleNamespace(
+            ProgrammingError=ProgrammingError,
+        ),
+    )
     session = DbtSession({"project_dir": str(tmp_path)})
     session._config = SimpleNamespace(credentials=SimpleNamespace(type="snowflake"))
     driver_error = ProgrammingError("synthetic SQL failure")
@@ -47,6 +66,7 @@ def test_snowflake_error_classification(tmp_path, monkeypatch, sqlstate, expecte
     error = DbtDatabaseError("scrubbed adapter message")
     error.__context__ = driver_error
     assert session._is_query_error(error) is expected
+    assert session._query_error_reason(error) == (None if expected else "sqlstate_not_recoverable")
 
 
 def test_closed_connection_does_not_resolve_lazy_handle(tmp_path):

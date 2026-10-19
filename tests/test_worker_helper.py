@@ -35,7 +35,9 @@ class QueryError(RuntimeError):
     pass
 
 class SessionError(RuntimeError):
-    pass
+    def __init__(self, message, *, reason="request_cleanup_failed"):
+        super().__init__(message)
+        self.reason = reason
 
 def compatibility():
     if os.environ.get("FAKE_INCOMPATIBLE") == "1":
@@ -70,6 +72,8 @@ class DbtSession:
             raise QueryError("deliberate query error")
         if sql == "cleanup-error":
             raise SessionError("deliberate cleanup error")
+        if sql == "unsafe-reason":
+            raise SessionError("safe display", reason="raw SQL and credentials")
         if sql == "sso-error":
             print(
                 "Initiating login request with your identity provider "
@@ -338,13 +342,23 @@ def test_recoverable_query_error_keeps_session_and_credential_snapshot(tmp_path:
         _stop(process, path)
 
 
-def test_session_cleanup_error_remains_fatal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("sql", "reason"),
+    [
+        ("cleanup-error", "request_cleanup_failed"),
+        ("unsafe-reason", "session_error"),
+    ],
+)
+def test_session_error_reason_is_validated_and_forwarded(
+    tmp_path: Path, sql: str, reason: str
+) -> None:
     process, path, _, _ = _start(tmp_path)
     sock, decoder, _ = _connect(path)
-    error = _execute(sock, decoder, "cleanup-error")[-1]
+    error = _execute(sock, decoder, sql)[-1]
     assert error["type"] == "error"
     assert error.get("reusable") is not True
-    assert "cleanup error" in error["message"]
+    assert error["retirement_reason"] == reason
+    assert "raw SQL and credentials" not in json.dumps(error)
     process.wait(timeout=5)
 
 

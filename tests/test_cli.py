@@ -11,6 +11,33 @@ from dbt_enhance.models import EnhanceError
 runner = CliRunner()
 
 
+@pytest.mark.parametrize("running", [False, True])
+def test_doctor_reports_last_retirement_without_starting_worker(tmp_path, monkeypatch, running):
+    from dbt_enhance import cli, dbt, popup, worker
+
+    monkeypatch.setenv("TMUX", "synthetic-test-session")
+    monkeypatch.setattr(cli.shutil, "which", lambda _: "/test/bin/hx")
+    monkeypatch.setattr(popup, "tmux_binary", lambda **_: "/test/bin/tmux")
+    monkeypatch.setattr(dbt, "discover_project", lambda _: tmp_path)
+    monkeypatch.setattr(dbt, "find_dbt", lambda *_: tmp_path / "dbt")
+    monkeypatch.setattr(worker, "project_python", lambda _: tmp_path / "python")
+    monkeypatch.setattr(
+        worker, "status", lambda _: {"pid": 101, "session_pid": 102} if running else None
+    )
+    monkeypatch.setattr(
+        worker,
+        "retirement_status",
+        lambda _: {
+            "reason": "connection_not_open",
+            "session_pid": 100,
+        },
+    )
+    monkeypatch.setattr(worker, "_spawn", lambda *_: pytest.fail("doctor started a worker"))
+    result = runner.invoke(app, ["doctor", "--file", str(tmp_path / "model.sql")])
+    assert result.exit_code == 0, result.output
+    assert "last worker retirement: connection_not_open (session 100)" in result.output
+
+
 def test_help_and_version():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

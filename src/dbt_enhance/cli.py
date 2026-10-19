@@ -265,7 +265,7 @@ def doctor(
             override = os.environ.get("DBT_ENHANCE_DBT")
             executable = find_dbt(project, Path(override) if override else None)
             checks.append(("dbt", True, str(executable)))
-            from dbt_enhance.worker import project_python, status
+            from dbt_enhance.worker import project_python, retirement_status, status
 
             selected = os.environ.get("DBT_ENHANCE_BACKEND", "worker")
             checks.append(("backend", selected in {"process", "worker"}, selected))
@@ -276,6 +276,15 @@ def doctor(
             if running:
                 detail = f"running (supervisor {running['pid']}, session {running['session_pid']})"
             checks.append(("project worker", True, detail))
+            retirement = retirement_status(project)
+            if retirement:
+                checks.append(
+                    (
+                        "last worker retirement",
+                        True,
+                        f"{retirement['reason']} (session {retirement['session_pid']})",
+                    )
+                )
         except (EnhanceError, OSError) as exc:
             checks.append(("project/dbt", False, str(exc)))
     for name, okay, detail in checks:

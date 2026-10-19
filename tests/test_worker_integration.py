@@ -164,11 +164,13 @@ def test_profile_resolved_by_dotenv_is_watched(native_worker, monkeypatch, faile
 @pytest.mark.parametrize("bad_sql", ["select * from missing_test_table", "select from"])
 def test_real_worker_query_error_keeps_session_and_connection(native_worker, bad_sql):
     project, request = native_worker
-    run_query(replace(
-        request,
-        sql="{% do run_query('create temp table kept_after_error as select 73 as marker') %} "
-        "select 1 as value",
-    ))
+    run_query(
+        replace(
+            request,
+            sql="{% do run_query('create temp table kept_after_error as select 73 as marker') %} "
+            "select 1 as value",
+        )
+    )
     before = worker.status(project.resolve())["session_pid"]
     with pytest.raises(EnhanceError):
         run_query(replace(request, sql=bad_sql))

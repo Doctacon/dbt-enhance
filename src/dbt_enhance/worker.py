@@ -25,7 +25,15 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from ._wire import IDLE_SECONDS, MAX_REQUEST, PROTOCOL, Decoder, WireError, encode
+from ._wire import (
+    IDLE_SECONDS,
+    MAX_REQUEST,
+    PROTOCOL,
+    Decoder,
+    WireError,
+    encode,
+    validate_retirement_reason,
+)
 from .dbt import (
     _child_environment,
     _notify,
@@ -223,6 +231,21 @@ def project_python(dbt: Path) -> Path:
     return interpreter.absolute()
 
 
+def _valid_last_retirement(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {"reason", "session_pid"}:
+        return None
+    reason = validate_retirement_reason(value.get("reason"))
+    session_pid = value.get("session_pid")
+    if (
+        reason is None
+        or not isinstance(session_pid, int)
+        or isinstance(session_pid, bool)
+        or session_pid <= 0
+    ):
+        return None
+    return {"reason": reason, "session_pid": session_pid}
+
+
 def _record(directory: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(_read(directory / "control.json"))
@@ -243,7 +266,22 @@ def _record(directory: Path) -> dict[str, Any] | None:
         raise EnhanceError(
             "Incompatible or malformed worker state; use the prior version to stop it."
         )
+    last_retirement = _valid_last_retirement(data.get("last_retirement"))
+    if last_retirement is None:
+        data.pop("last_retirement", None)
+    else:
+        data["last_retirement"] = last_retirement
     return data
+
+
+def _persist_retirement(directory: Path, record: dict[str, Any], retirement_reason: object) -> None:
+    """Persist only a fixed reason and the current native session PID."""
+    session_pid = record.get("session_pid")
+    if not isinstance(session_pid, int) or isinstance(session_pid, bool) or session_pid <= 0:
+        return
+    reason = validate_retirement_reason(retirement_reason) or "worker_failure"
+    record["last_retirement"] = {"reason": reason, "session_pid": session_pid}
+    _write_state(directory / "control.json", record)
 
 
 def _stat_stamp(path: Path) -> tuple[int, int, int] | None:
@@ -450,6 +488,7 @@ def _spawn(
     interpreter: Path,
     environment: dict[str, str],
     deadline: _Deadline,
+    last_retirement: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], subprocess.Popen]:
     record = {
         "protocol": PROTOCOL,
@@ -458,6 +497,9 @@ def _spawn(
         "generation": generation,
         "watched": [],
     }
+    validated_retirement = _valid_last_retirement(last_retirement)
+    if validated_retirement is not None:
+        record["last_retirement"] = validated_retirement
     bootstrap = json.dumps(
         {
             "protocol": PROTOCOL,
@@ -584,6 +626,7 @@ def run_query(
     execution_sent = False
     session_reusable = False
     process = None
+    last_retirement = None
 
     def finish() -> None:
         if sock is not None:
@@ -611,6 +654,8 @@ def run_query(
             cleanup.callback(finish)
             generation = _generation(project, dbt, interpreter, request, environment, key)
             record = _record(directory)
+            if record is not None:
+                last_retirement = _valid_last_retirement(record.get("last_retirement"))
             if record and (record["generation"] != generation or not _watched_unchanged(record)):
                 _notify(on_status, "Restarting worker for changed configuration")
                 _stop_record(directory, record, min(2.0, deadline.remaining()))
@@ -624,7 +669,13 @@ def run_query(
             if record is None:
                 _notify(on_status, "Starting project dbt worker")
                 record, process = _spawn(
-                    directory, generation, context, interpreter, environment, deadline
+                    directory,
+                    generation,
+                    context,
+                    interpreter,
+                    environment,
+                    deadline,
+                    last_retirement,
                 )
                 sock, ready, decoder = _open_worker(directory, record, process, deadline)
             assert sock is not None and decoder is not None and ready is not None
@@ -668,6 +719,8 @@ def run_query(
                         _write_state(directory / "control.json", record)
                         deadline.remaining()
                         session_reusable = True
+                    else:
+                        _persist_retirement(directory, record, message.get("retirement_reason"))
                     detail = str(message.get("message", "Worker query failed."))[:8000]
                     if message.get("sso") or deadline.sso:
                         detail = SSO_GUIDANCE
@@ -731,6 +784,18 @@ def status(project: Path) -> dict[str, Any] | None:
     except (FileNotFoundError, ConnectionRefusedError, ConnectionError):
         return None
     return {key: ready.get(key) for key in ("pid", "session_pid", "versions")}
+
+
+def retirement_status(project: Path) -> dict[str, Any] | None:
+    """Read the last validated retirement diagnostic without requiring a live worker."""
+    located = _slot(project, _Deadline(1.0), create=False)
+    if located is None:
+        return None
+    directory, _ = located
+    record = _record(directory)
+    if record is None:
+        return None
+    return _valid_last_retirement(record.get("last_retirement"))
 
 
 def stop(project: Path) -> bool:

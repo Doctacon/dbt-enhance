@@ -36,6 +36,7 @@ try:
         Decoder,
         WireError,
         encode,
+        validate_retirement_reason,
     )
 except ImportError:  # Standalone copy.
     from _wire import (
@@ -47,6 +48,7 @@ except ImportError:  # Standalone copy.
         Decoder,
         WireError,
         encode,
+        validate_retirement_reason,
     )
 
 _BOOTSTRAP_LIMIT = 64 * 1024
@@ -242,6 +244,19 @@ def _child_scrub(error: object, session_module: Any) -> str:
             return "Native dbt session failed safely."
 
 
+def _child_retirement_reason(error: BaseException, session_module: Any) -> str:
+    """Classify a fatal child error without reflecting exception-controlled text."""
+    is_session_error = False
+    try:
+        is_session_error = isinstance(error, session_module.SessionError)
+    except Exception:
+        pass
+    if is_session_error:
+        reason = validate_retirement_reason(getattr(error, "reason", None))
+        return reason or "session_error"
+    return "non_dbt_error"
+
+
 def _arm_parent_death(parent_pid: int) -> None:
     if sys.platform.startswith("linux"):
         try:
@@ -376,7 +391,14 @@ def _session_main(fd_text: str) -> int:
                 return 1
     except BaseException as error:
         try:
-            _child_send(sock, {"type": "error", "message": _child_scrub(error, session_module)})
+            _child_send(
+                sock,
+                {
+                    "type": "error",
+                    "message": _child_scrub(error, session_module),
+                    "retirement_reason": _child_retirement_reason(error, session_module),
+                },
+            )
         except BaseException:
             pass
         return 1
@@ -526,7 +548,7 @@ class _Supervisor:
 
     def _close_client(self, client: _Client) -> None:
         if self.active is client and self.state == "active":
-            self._retire("Active client disconnected.")
+            self._retire("Active client disconnected.", retirement_reason="client_disconnect")
         fd = client.sock.fileno()
         try:
             self.selector.unregister(client.sock)
@@ -785,7 +807,8 @@ class _Supervisor:
                 return
             error = _safe_message(message.get("message", "Native dbt session failed to start."))
             self.startup_error = error
-            self._retire(error)
+            retirement_reason = validate_retirement_reason(message.get("retirement_reason"))
+            self._retire(error, retirement_reason=retirement_reason or "worker_failure")
             return
         if self.state != "active":
             self._retire("Native dbt session sent an unexpected response.")
@@ -830,7 +853,8 @@ class _Supervisor:
             )
             return
         error = _safe_message(message.get("message", "Native dbt session failed."))
-        self._retire(error)
+        retirement_reason = validate_retirement_reason(message.get("retirement_reason"))
+        self._retire(error, retirement_reason=retirement_reason or "worker_failure")
 
     def _read_child(self, now: float) -> None:
         assert self.child_socket is not None
@@ -927,9 +951,11 @@ class _Supervisor:
         *,
         offender: _Client | None = None,
         stopped_by: _Client | None = None,
+        retirement_reason: str = "worker_failure",
     ) -> None:
         if self.state == "retiring":
             return
+        retirement_reason = validate_retirement_reason(retirement_reason) or "worker_failure"
         was_starting = self.state == "starting"
         self.state = "retiring"
         if (
@@ -944,6 +970,7 @@ class _Supervisor:
                     "request_id": self.request_id,
                     "message": _safe_message(reason),
                     "sso": self.sso_sent,
+                    "retirement_reason": retirement_reason,
                 },
                 close=True,
             )
@@ -952,7 +979,13 @@ class _Supervisor:
             for client in list(self.clients.values()):
                 if client.authenticated and client is not offender and client is not stopped_by:
                     self._queue(
-                        client, {"type": "error", "message": self.startup_error}, close=True
+                        client,
+                        {
+                            "type": "error",
+                            "message": self.startup_error,
+                            "retirement_reason": retirement_reason,
+                        },
+                        close=True,
                     )
         if self.listener is not None:
             try:
@@ -975,7 +1008,7 @@ class _Supervisor:
         elif self.state == "ready" and now > self.idle_deadline:
             self._retire("Worker idle timeout expired.")
         elif self.state == "active" and now > self.request_deadline:
-            self._retire("dbt request timed out.")
+            self._retire("dbt request timed out.", retirement_reason="timeout")
 
     def run(self) -> int:
         try:

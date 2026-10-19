@@ -110,7 +110,13 @@ ProgrammingError SQLSTATE classes 22, 23, and 42 are recoverable. Other failures
 cancellation, malformed execution transport, or uncertain disconnect retire the
 session; there is no automatic query replay. Recoverable errors carry the same
 credential-file snapshots as successes, including a failed first request. The
-supervisor returns to ready only after flushing the terminal error response. Stop uses authenticated IPC, not a PID file. Graceful
+supervisor returns to ready only after flushing the terminal error response.
+Fatal responses also carry an allowlisted retirement reason. The client records
+only that code and the affected session PID as `last_retirement` in `control.json`,
+preserves it across replacement, and exposes it through `doctor`. Raw exceptions,
+SQL, and credentials are not diagnostic fields. The reason distinguishes missing
+driver-error provenance, rejected SQLSTATE, closed connection, failed health
+check, and failed cleanup; it does not infer a cause beyond the observed gate. Stop uses authenticated IPC, not a PID file. Graceful
 native cleanup is bounded by process termination. The separate UI timer remains
 necessary, and local cleanup still cannot guarantee remote warehouse cancellation.
 
@@ -216,6 +222,15 @@ fresh rows and compiled SQL while dbt reports `PartialParsingSkipParsing`. Other
 tests cover custom project/env artifact paths and rejection of stale run results.
 Core 1.10.22, 1.12.5, and 1.12.6 have been exercised locally. Test fixtures never use
 user profiles and clear inherited artifact-path overrides before local testing.
+
+`tests/test_snowflake_session.py` exercises native parsing, compilation, and the
+real Snowflake adapter's exception handler using a synthetic connector handle.
+It covers SQLSTATE 42S02, 42000, and 22012, plus closed-handle, health-check, and
+cleanup failures. Run it with `uv run --with dbt-snowflake python -m pytest
+tests/test_snowflake_session.py`. This is offline adapter-path coverage, not proof
+of live Snowflake connector/session retention. A live report of retirement after
+these SQL errors still requires the retirement reason and installed adapter/
+connector versions to diagnose.
 
 The optional terminal test creates a private tmux server, runs a real Helix
 instance with generated config, selects only one query line from a file containing

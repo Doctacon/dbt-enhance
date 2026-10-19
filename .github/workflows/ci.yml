@@ -31,6 +31,11 @@ jobs:
       - run: uv run pytest
         env:
           DBT_SEND_ANONYMOUS_USAGE_STATS: 'false'
+      - name: Offline Snowflake error recovery
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: uv run --with 'dbt-core==1.12.5' --with 'dbt-snowflake==1.10.2' python -m pytest tests/test_snowflake_session.py
+        env:
+          DBT_SEND_ANONYMOUS_USAGE_STATS: 'false'
       - run: uv build
       - name: Earlier dbt Core compatibility
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'

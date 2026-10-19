@@ -30,7 +30,9 @@ class QueryError(RuntimeError):
     pass
 
 class SessionError(RuntimeError):
-    pass
+    def __init__(self, message, *, reason="request_cleanup_failed"):
+        super().__init__(message)
+        self.reason = reason
 
 def compatibility():
     return {"dbt_core": "test", "python": "test"}
@@ -236,13 +238,15 @@ def test_context_or_credentials_change_recycles_worker(setup_worker, monkeypatch
 
 
 def test_query_error_reuses_session_without_replaying_sql(setup_worker):
-    _, request = setup_worker
+    project, request = setup_worker
     before = worker.run_query(request)
     with pytest.raises(EnhanceError, match="deliberate SQL error"):
         worker.run_query(replace(request, sql="fail"))
+    assert worker.retirement_status(project.resolve()) is None
     after = worker.run_query(request)
     assert after.rows[0][0] == before.rows[0][0]
     assert after.rows[0][1] == 3
+    assert worker.retirement_status(project.resolve()) is None
 
 
 @pytest.mark.parametrize("failure", ["watched", "message", "cancelled"])
@@ -272,17 +276,48 @@ def test_reusable_error_still_retires_on_malformed_reply_or_cancellation(
 
 
 @pytest.mark.parametrize(
-    ("sql", "message"),
-    [("fatal", "deliberate fatal error"), ("cleanup-fail", "deliberate cleanup failure")],
+    ("sql", "message", "reason"),
+    [
+        ("fatal", "deliberate fatal error", "non_dbt_error"),
+        ("cleanup-fail", "deliberate cleanup failure", "request_cleanup_failed"),
+    ],
 )
-def test_fatal_and_cleanup_errors_retire_session(setup_worker, sql, message):
-    _, request = setup_worker
+def test_fatal_errors_persist_reason_across_replacement(setup_worker, sql, message, reason):
+    project, request = setup_worker
     before = worker.run_query(request)
     with pytest.raises(EnhanceError, match=message):
         worker.run_query(replace(request, sql=sql))
+    expected = {"reason": reason, "session_pid": before.rows[0][0]}
+    assert worker.retirement_status(project.resolve()) == expected
     after = worker.run_query(request)
     assert after.rows[0][0] != before.rows[0][0]
     assert after.rows[0][1] == 1
+    assert worker.retirement_status(project.resolve()) == expected
+
+
+def test_arbitrary_retirement_reason_is_replaced_not_persisted(setup_worker, monkeypatch):
+    project, request = setup_worker
+    before = worker.run_query(request)
+    receive = worker._receive
+    unsafe = "sqlstate from select synthetic-secret"
+
+    def receive_unsafe_reason(*args, **kwargs):
+        message = receive(*args, **kwargs)
+        if message.get("type") == "error" and message.get("reusable") is not True:
+            message["retirement_reason"] = unsafe
+        return message
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "_receive", receive_unsafe_reason)
+        with pytest.raises(EnhanceError, match="deliberate fatal error"):
+            worker.run_query(replace(request, sql="fatal"))
+
+    expected = {"reason": "worker_failure", "session_pid": before.rows[0][0]}
+    assert worker.retirement_status(project.resolve()) == expected
+    directory, _ = worker._slot(project.resolve(), worker._Deadline(2), create=False)
+    state = (directory / "control.json").read_text()
+    assert unsafe not in state
+    assert "deliberate fatal error" not in state
 
 
 def test_first_query_error_persists_credential_snapshot(setup_worker):

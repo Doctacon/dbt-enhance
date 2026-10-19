@@ -340,6 +340,7 @@ def test_first_query_error_recovers_but_cleanup_failure_retires(tmp_path: Path) 
             session.execute("select * from missing_table", 2)
         except SessionError as error:
             assert "missing_table" in str(error)
+            assert error.reason == "request_cleanup_failed"
         else:
             raise AssertionError("failed cleanup must retire")
         assert session._closed

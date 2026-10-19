@@ -35,7 +35,11 @@ class UnsupportedSession(RuntimeError):
 
 
 class SessionError(RuntimeError):
-    """A scrubbed error from a session that has been permanently retired."""
+    """A scrubbed error with a content-free retirement diagnostic."""
+
+    def __init__(self, message: str, *, reason: str = "session_error") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class QueryError(RuntimeError):
@@ -360,38 +364,50 @@ class DbtSession:
         return True
 
     def _is_query_error(self, error: Exception) -> bool:
-        """Recognize statement failures, not auth, transport, or internal errors.
+        return self._query_error_reason(error) is None
+
+    def _query_error_reason(self, error: Exception) -> str | None:
+        """Return the failed retention gate, or None for a recognized SQL error.
 
         Adapters wrap driver exceptions differently (DuckDB uses __cause__,
         Snowflake uses __context__). Never classify by error-message text.
         """
         runtime_error = importlib.import_module("dbt_common.exceptions").DbtRuntimeError
         if not isinstance(error, runtime_error):
-            return False
+            return "non_dbt_error"
         adapter_type = self._config.credentials.type
         if adapter_type == "duckdb":
             driver = importlib.import_module("duckdb")
-            query_errors = tuple(getattr(driver, name) for name in (
-                "ParserException", "BinderException", "CatalogException",
-                "ConversionException", "OutOfRangeException", "ConstraintException",
-            ))
+            query_errors = tuple(
+                getattr(driver, name)
+                for name in (
+                    "ParserException",
+                    "BinderException",
+                    "CatalogException",
+                    "ConversionException",
+                    "OutOfRangeException",
+                    "ConstraintException",
+                )
+            )
         elif adapter_type == "snowflake":
             driver = importlib.import_module("snowflake.connector.errors")
             query_errors = (driver.ProgrammingError,)
         else:
-            return False
+            return "driver_error_missing"
         seen: set[int] = set()
         current: BaseException | None = error
         while current is not None and id(current) not in seen:
             seen.add(id(current))
             if isinstance(current, query_errors):
                 if adapter_type == "duckdb":
-                    return True
+                    return None
                 # SQLSTATE data, integrity, and syntax/access-rule errors only.
                 # Session expiration and connection/auth errors must retire.
-                return str(getattr(current, "sqlstate", ""))[:2] in {"22", "23", "42"}
+                if str(getattr(current, "sqlstate", ""))[:2] in {"22", "23", "42"}:
+                    return None
+                return "sqlstate_not_recoverable"
             current = current.__cause__ or current.__context__
-        return False
+        return "driver_error_missing"
 
     @staticmethod
     def _table_result(table: Any) -> tuple[list[str], list[list[Any]]]:
@@ -458,19 +474,20 @@ class DbtSession:
         except Exception as error:
             message = _scrub_error(error)
             try:
-                recoverable = (
-                    self._initialized
-                    and runner is not None
-                    and self._is_query_error(error)
-                    and self._connection_is_open()
-                )
+                if not self._initialized or runner is None:
+                    reason = "request_setup_failed"
+                else:
+                    reason = self._query_error_reason(error)
+                    if reason is None and not self._connection_is_open():
+                        reason = "connection_not_open"
             except Exception:
-                recoverable = False
+                reason = "recovery_check_failed"
+            recoverable = reason is None
             if not recoverable:
                 self._retire()
                 if isinstance(error, UnsupportedSession):
                     raise UnsupportedSession(message) from None
-                raise SessionError(message) from None
+                raise SessionError(message, reason=reason) from None
         finally:
             try:
                 if task is not None:
@@ -495,7 +512,9 @@ class DbtSession:
                 if not self._closed:
                     self._retire()
                 if completed or recoverable:
-                    raise SessionError(message or _scrub_error(cleanup_error)) from None
+                    raise SessionError(
+                        message or _scrub_error(cleanup_error), reason="request_cleanup_failed"
+                    ) from None
         raise QueryError(message) from None
 
     def _retire(self) -> None:

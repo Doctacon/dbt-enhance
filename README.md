@@ -289,6 +289,17 @@ dbt-enhance doctor --file /absolute/project/models/model.sql
 dbt-enhance stop --file /absolute/project/models/model.sql
 ```
 
+`doctor` also reports the last recorded worker retirement, even after the next
+worker starts. Fatal worker responses store only an allowlisted reason code and
+session PID in `control.json` (`last_retirement`), never SQL or exception text.
+For SQL-error recovery debugging, the codes distinguish `driver_error_missing`,
+`sqlstate_not_recoverable`, `connection_not_open`, `recovery_check_failed`, and
+`request_cleanup_failed`. This diagnostic describes the failed retention check;
+it does not prove why a connector closed or lost an exception chain. If reporting
+a Snowflake recovery failure, include this code and your `dbt-core`, `dbt-snowflake`,
+and `snowflake-connector-python` versions—not the entire control file, which holds
+an authentication token.
+
 `stop` also interrupts an active query. Worker sockets/state are private to your
 OS user; credentials and selections are not placed in worker command arguments.
 The editor environment is inherited by the worker and remains in its memory for
