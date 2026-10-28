@@ -1,281 +1,193 @@
-# Architecture and integration evidence
+# Architecture
 
 ## Execution path
 
 ```text
-Helix selection (stdin) + buffer path (quoted heredoc)
-  → dbt-enhance popup
-  → private JSON handoff → tmux display-popup → Textual QueryApp
-  → background worker → discover_project(buffer)
-  → selected backend
-    process (explicit opt-out): project's dbt show --inline ... --output json --log-format json
-      → ShowNode rows + ArtifactWritten path → run_results.json SQL
-    worker (default): authenticated per-project Unix socket → stdlib supervisor
-      → persistent native dbt session in project's Python → native rows + compiled SQL
-  → scrollable table + expandable SQL
+Helix selection + saved buffer path
+  → private popup handoff → tmux popup → Textual QueryApp
+  → settings resolution and target safety policy
+  → backend selection
+      worker: project-Python supervisor → native retained dbt session
+      process: public dbt show subprocess → invocation-matched run_results.json
+  → QueryResult → ephemeral PreviewModel → table / actual compiled SQL / copies
+  → optional metadata-only DiagnosticStore record
 ```
 
-`models.py` is the small shared contract: `QueryRequest`, `QueryResult`,
-`EnhanceError`, and `QueryRunner`. Editor transport, dbt execution, and UI can each
-be exercised through that contract without a live editor or warehouse.
+`query` uses the same TUI without tmux; `query --json` uses the same execution
+contract without a screen. `demo` uses a precomputed result and does not import or
+invoke dbt.
 
-- **`dbt.py`** owns discovery, executable resolution, backend dispatch, shared child
-  environment defaults, and the existing isolated-process implementation. It
-  imports no dbt Core code into the tool interpreter.
-- **`worker.py`** owns the default worker client, a project-scoped request lock,
-  private state, context fingerprints, interpreter selection, deadlines, and
-  authenticated status/stop. It never signals a PID read from a state file.
-- **`_worker_helper.py` / `_wire.py`** form a standalone project-Python supervisor
-  with bounded JSON framing. A separate session child keeps dbt and connections
-  warm; the supervisor remains responsive if dbt holds its Python GIL.
-- **`_session.py`** contains the version-gated native dbt integration. It owns one
-  adapter on one thread, refreshes manifests through dbt's partial parser, and
-  invokes native inline setup, compilation, and `ShowRunner.execute`. It is not a
-  replacement Jinja/ref resolver and never runs dbt concurrently in one process.
-- **`popup.py`** owns the private handoff and real terminal lifecycle. The child
-  runs via the same Python executable as the parent. Credentials are not passed
-  through tmux `-e` command arguments.
-- **`helix.py` / `install.py`** own safe keybinding generation, comment-preserving
-  TOML merging, backup/atomic replacement, and durable uv tool installation.
-- **`ui.py`** owns rendering, a UI-thread deadline, and a single daemon query
-  thread. Progress and final outcomes arrive through thread-safe queued messages;
-  a terminal-state guard rejects late deliveries. A fake runner or precomputed
-  result exercises the same UI as a real query.
-- **`cli.py`** connects these modules; `query --json` exposes structured results
-  without a terminal UI. `demo` never imports or invokes dbt.
+## Module responsibilities
 
-## Why these decisions
+- **`models.py`** — `QueryRequest`, `ResolvedContext`, `QueryResult`, status/error
+  vocabulary, and the runner seam.
+- **`settings.py`** — strict user-local TOML, typed values, precedence, canonical
+  project matching, and immutable target-name policy.
+- **`preflight.py` / `_project_helper.py`** — bounded native dbt configuration
+  resolution in the project interpreter. The helper resolves target, adapter, and
+  allowlisted versions before adapter registration, manifest parsing, compilation,
+  connection, or execution. SQL and credentials are not in its protocol.
+- **`support.py` / `support-matrix.json`** — strict evidence matrix, admission vs
+  certification, backend choice, and explicit release-policy transition gates.
+- **`dbt.py`** — discovery, executable resolution, backend dispatch, process-mode
+  execution, exact artifact association, bounded output, cancellation, and the
+  optional diagnostics seam.
+- **`worker.py`** — private project slots, context fingerprints, authenticated IPC,
+  bounded/cancellable queue wait, idle lifetime, inventory/disconnect/reset, and
+  retirement metadata.
+- **`_worker_helper.py` / `_wire.py`** — standalone project-Python supervisor and
+  bounded JSON framing. The supervisor remains responsive when the native session
+  is blocked.
+- **`_session.py`** — version-gated private dbt integration: configuration/target
+  guard, fresh manifest validation, native inline compilation/execution, retained
+  adapter/session, rollback/cleanup, and no replay.
+- **`preview.py`** — pure local search/filter/sort/size/hide/pinned-prefix transforms
+  that retain source row/column identities for correct copies.
+- **`actions.py`, `search.py`, `ui_dialogs.py`, `ui.py`** — keyboard-browsable
+  executable actions, overlapping full-source literal find with source offsets,
+  typed local transforms, width-safe pinned prefixes, one-use backend choice,
+  context labels, UI-thread deadline, original-identity copy, confirmed
+  project-worker reset, and separate local-error/strict-report review surfaces.
+- **`diagnostics.py`** — private bounded state plus a second strict sanitizer for
+  shareable reports.
+- **`helix.py`, `install.py`, `lifecycle.py`** — explicit-consent owned Helix shell
+  bridge, key-map merge/restoration/removal checks, persistent installation,
+  immutable provenance, candidate validation, and preview/apply update, rollback,
+  and removal.
+- **`popup.py`** — literal filename transport, private handoff, and popup process
+  lifecycle.
+- **`cli.py`** — public command wiring. Imports UI/dbt only when needed.
 
-**External dbt, not a bundled adapter.** Users can keep incompatible adapters and
-Python versions in separate projects. Both backends avoid embedding dbt's
-process-global state in the UI. The worker uses private Core
-interfaces only inside its separate project-interpreter child; unsupported setups
-keep the explicit process backend rather than silently skipping native behavior.
+## Safety and consistency decisions
 
-**One dbt execution, not compile-then-show.** dbt's `show` runner applies the
-adapter's `get_show_sql` macro to compiled SQL, then executes that string. Reading
-the run-results artifact from that same invocation gives the SQL actually used,
-including the row limit. Recompiling separately could disagree or duplicate
-macros with side effects.
+### Local dbt remains authoritative
 
-**Reuse the project's normal parse cache and artifacts.** No target/log path is
-overridden. dbt resolves its project settings and environment overrides, reads
-`partial_parse.msgpack`, validates the cache, and reparses only when needed. This
-replaces the former per-query temporary target directory, which forced a full
-project parse on every selection. Normal project manifests, run results, cache,
-and logs are deliberately updated and retained; there is no separate cache layer.
+The tool does not bundle adapters or define credentials. Discovery begins at the
+source buffer, and execution uses the project interpreter/environment. This permits
+separate projects to use incompatible dbt/adapter stacks while keeping dbt global
+state outside the viewer process.
 
-`ShowNode` does not carry the final executed SQL, so `--no-write-json` would remove
-our reliable source for it. JSON debug logging supplies `ArtifactWritten` with
-the resolved `run_results.json` path, avoiding our own dbt YAML/Jinja path resolver.
-The preview, write event, and artifact metadata must share an invocation ID; a
-stale or concurrently overwritten artifact is an error, never another query's SQL.
-Debug SQL log messages are not used to reconstruct compiled SQL. Successful process
-output is JSON-decoded once for both preview and artifact discovery, within the
-existing output-size limit. Worker mode instead reads the native execution
-result's final `compiled_code` and Agate table, so it can disable JSON artifact
-writes without losing compiled SQL or empty-result column names. Neither backend
-redirects dbt to private artifact directories. Ordinary external dbt commands
-sharing the target are not serialized.
+### Native preflight before guarded execution
 
-**Default worker lifetime.** The process backend is an explicit opt-out. Worker mode
-requires a recognizable Python dbt console script; its absolute shebang interpreter
-is used without resolving away a virtualenv symlink. A stdlib-only helper runs
-under that interpreter and starts a separate native-session child. dbt-enhance
-need not be installed in the project's environment. The helper removes its own
-package directory from the native import path so `dbt_enhance/dbt.py` cannot
-shadow the project's actual `dbt` package. Successful requests retain that child
-and its connection for up to ten idle minutes. Native compilation uses
-fresh request flags/invocation state and a freshly validated native manifest, not
-cached query results. Relation-cache state is cleared; tracked transactions are
-rolled back between requests. Connection-local temporary objects/settings can
-persist, which is an intentional semantic difference from fresh CLI invocations.
+A safety allowlist names only a canonical project and exact dbt target names.
+Worker mode resolves and checks it before manifest parse/compile. Process mode uses
+the same native resolution where possible and pins the proven target on the public
+command. If proof is unavailable, a guarded query is blocked. Only unguarded
+explicit process mode can use an unverified public wrapper. This avoids pretending
+that profile paths or destination details are policy fields.
 
-The UI's runner interface is unchanged. A per-project advisory lock serializes
-requests and is deadline/cancellation-aware. An opaque keyed project slot under a
-private runtime directory contains a random authentication token and generation
-fingerprint, not raw environment values. Worker identity and startup use the same
-normalized environment: shell bookkeeping (`_`, `OLDPWD`, `SHLVL`), popup terminal
-keys (`TERM`, `TERM_PROGRAM`, `TMUX`, `TMUX_PANE`, `LINES`, `COLUMNS`), and Yazi
-launch markers (`YAZI_ID`, `YAZI_LEVEL`) are excluded; `PWD` is the worker's project
-working directory. This does not alter the UI environment or the explicit process
-backend. All other variables remain significant because profiles/Jinja may depend
-on arbitrary names, not only DBT/Snowflake prefixes. Tests cover changed launch
-markers and the real popup handoff path; they do not establish live Yazi behavior.
-Configuration/environment/package changes retire the old worker before replacement
-and persist `configuration_changed` with its session PID. Native preflight reports the resolved
-profile path before reading it (including `.env` resolution); credential paths
-follow after configuration. First-read fingerprints are retained across both
-callbacks. Credential-file changes are watched;
-manual edits to imported Python source require an explicit stop. Sockets and state
-files are private to the OS user, and SQL is carried over bounded JSON frames.
+### No silent fallback or replay
 
-The supervisor, not dbt's execution thread, enforces the accepted request timeout
-and observes client disconnects. Recognized driver statement errors retain the
-session only after successful rollback/request cleanup and an open-connection
-check. DuckDB parser/binder/catalog/conversion/range/constraint errors and Snowflake
-ProgrammingError SQLSTATE classes 22, 23, and 42 are recoverable. Native compilation
-and parsing errors before query execution are also recoverable after adapter/config
-bootstrap, including Core's plain `DbtBaseException` inline-parser wrapper. Recovery
-is deliberately not inferred through arbitrary fatal exception wrappers. Failed
-compilation drops the manifest from both the session and Click context, clears
-dependency/macro-resolution state, and rebuilds on the next request. A missing or
-INIT connection is safe for this path and is never opened just to check health;
-an existing connection must remain healthy. Profile/bootstrap errors still retire.
-Other failures,
-cancellation, malformed execution transport, or uncertain disconnect retire the
-session; there is no automatic query replay. Recoverable errors carry the same
-credential-file snapshots as successes, including a failed first request. The
-supervisor returns to ready only after flushing the terminal error response.
-Fatal responses also carry an allowlisted retirement reason. The client records
-only that code and the affected session PID as `last_retirement` in `control.json`,
-preserves it across replacement, and exposes it through `doctor`. Raw exceptions,
-SQL, and credentials are not diagnostic fields. The reason distinguishes missing
-driver-error provenance, rejected SQLSTATE, closed connection, failed health
-check, and failed cleanup; it does not infer a cause beyond the observed gate. Stop uses authenticated IPC, not a PID file. Graceful
-native cleanup is bounded by process termination. The separate UI timer remains
-necessary, and local cleanup still cannot guarantee remote warehouse cancellation.
+`auto` can select a certified worker only from an exact local matrix row. Without
+one, the TUI asks before execution and JSON stops. Once execution might have begun,
+failure/cancellation is never replayed on another backend. Native adapter/connector
+retry behavior is separate.
 
-**Preview-specific connection work.** The child defaults `DBT_POPULATE_CACHE=false`
-without overriding an explicit environment setting. This skips eager schema cache
-loading, not the project partial-parse cache or Jinja/ref compilation; standard
-`get_relation` calls fall back to
-warehouse introspection on a cache miss. Custom macros may need the opt-in cache.
-Anonymous usage stats and artifact-ingest uploads are explicitly disabled, without
-clearing `DBT_CLOUD_*` inputs a profile might require. `--no-version-check` is not
-used: it disables `require-dbt-version` enforcement, not a general PyPI check.
-Optional Snowflake platform detection defaults off where the connector supports
-its environment switch, preserving an explicit operator value.
+### One execution supplies rows and SQL
 
-**A deadline independent of cleanup.** A backend polling timeout cannot deliver
-its exception while a `finally` block is stuck. Process cleanup now uses only
-bounded waits and preserves the primary timeout/cancellation if cleanup fails.
-The popup separately owns its deadline, displays expiry, requests cancellation,
-and ignores all late results/progress/errors. A daemon query thread and non-blocking
-message delivery avoid executor shutdown waiting indefinitely. Closing gives the
-worker a bounded two-second grace to terminate ordinary children before process
-exit; truly stuck OS/interop processes may remain. The UI watchdog cannot recover
-a blocked UI event loop or operating system.
+Public process mode parses dbt JSON output and accepts only a `run_results.json`
+artifact from the same invocation. Native worker mode reads rows, columns, and final
+compiled code from the native result. Missing/incompatible evidence is an error,
+not reconstructed SQL.
 
-**Non-interactive SSO with safe guidance.** Browser callback authentication may
-work with stdin disconnected, but paste-URL fallback cannot. Unbuffered Python
-output and `read1()` make small connector prompts observable before process exit.
-Only recognized fixed prompt states reach progress, never raw auth URLs. Known
-SSO EOF/fallback errors and SSO timeouts point to terminal `dbt debug` and approved
-credential caching. The tool does not manage credentials or alter authentication.
+### Worker isolation and lifetime
 
-**Literal existing LIMIT clauses.** Lexical detection skips strings, comments,
-Jinja regions and nested parentheses. A selection with a literal top-level LIMIT
-is wrapped in a derived table while retaining dbt's requested preview cap and
-unaltered executed-SQL artifact. Other queries keep their outer ordering unchanged.
-This is not full SQL/Jinja parsing: generated clauses are not detected and final
-ordering of a wrapped query is warehouse-dependent.
+One worker serializes one project/context. The UI waits on a private advisory lock
+with a deadline; cancelling a waiter is isolated from the active owner. Fingerprints
+include significant environment/profile/interpreter/package inputs. Context change,
+fatal/uncertain failure, cancellation, or cleanup failure retires state. Idle expiry
+is configurable but bounded. Closing a completed viewer does not itself close the
+session.
 
-**tmux rather than terminal takeover.** Helix's `pipe-to` captures process streams;
-it is not a terminal for a TUI. tmux owns a popup PTY while Helix waits safely. A
-standalone `query` command remains available outside tmux.
+Authenticated control acts on a live supervisor, never a PID copied from stale
+state. `disconnect` is idle-only; active reset is explicit. Local process retirement
+and `requested_unverified` cancellation are not proof of remote cancellation.
 
-**Persistent installation from uvx.** Referencing uvx's temporary cache interpreter
-in a permanent editor key map is brittle. Setup discovers its installation
-provenance, installs the same source as a uv tool, and writes the stable tool
-executable path into the mapping. Git sources retain their resolved commit.
+### Preview is a projection, not a new query system
 
-**Literal filename transport.** Helix expansions are not shell-escaped. SQL is
-never inserted into a shell command; it arrives on stdin. The buffer path is read
-with `IFS= read -r` from a top-level, quoted heredoc with a fresh 128-bit delimiter.
-The resulting variable is passed as a quoted argument. This handles spaces,
-apostrophes, dollars, backticks, and Unicode. Newline-containing filenames are not
-supported. A top-level heredoc also avoids old macOS Bash command-substitution
-parsing bugs. The generated mapping assumes Helix's default POSIX shell.
+The result cap is applied by dbt. Search and transforms run only over fetched rows,
+are ephemeral, and preserve source identity for full-value copying. Typed operations
+are capability-gated; unknown metadata never enables ordered comparisons by guess.
+There is no arbitrary reorder, rerun, export, or query history.
 
-## Primary sources consulted
+### Diagnostics have a narrow vocabulary
 
-1. [Helix command-line expansions and exceptions](https://docs.helix-editor.com/command-line.html):
-   `buffer_name` is relative to the editor working directory, `pipe-to` supports
-   expansions but passes shell quoting through, and selection text can be piped.
-2. [Helix commands](https://docs.helix-editor.com/commands.html): `pipe-to` runs for
-   each selection and ignores output. The implementation does not use `pipe`,
-   which would replace the selection.
-3. [dbt show reference](https://docs.getdbt.com/reference/commands/show): native
-   inline compilation/execution, JSON output, and preview limits.
-4. [dbt Core 1.10.22 show.py](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/task/show.py):
-   `ShowRunner.execute` replaces `compiled_code` with `get_show_sql` output before
-   execution. `ShowTask.task_end_messages` emits `ShowNode.preview` as Agate JSON.
-5. [dbt Core 1.10.22 compile.py](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/task/compile.py):
-   inline SQL is parsed as a synthetic `inline_query` SQL operation, not the open
-   model. This motivates the documented model-context limitations.
-6. [dbt Core 1.10.22 runnable.py](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/task/runnable.py):
-   run-results are written under `project_target_path` when `write_json` is enabled;
-   `ArtifactWritten` reports their resolved path. Real tests cover project/environment
-   path precedence, artifact invocation IDs, and reuse of the partial-parse cache.
-7. [dbt Core 1.10.22 CLI parameters](https://github.com/dbt-labs/dbt-core/blob/v1.10.22/core/dbt/cli/params.py):
-   cache population, artifact-upload opt-out, and the purpose of version checks.
-8. [Snowflake browser authentication](https://github.com/snowflakedb/snowflake-connector-python/blob/main/src/snowflake/connector/auth/webbrowser.py):
-   browser callback versus `input()` redirect fallback, including blocking socket waits.
-9. [Snowflake platform detection](https://github.com/snowflakedb/snowflake-connector-python/blob/main/src/snowflake/connector/platform_detection.py):
-   optional cloud metadata detection and its environment opt-out (version-dependent).
-10. [Snowflake federated authentication](https://docs.snowflake.com/en/user-guide/admin-security-fed-auth-use)
-    and [dbt-snowflake credentials](https://github.com/dbt-labs/dbt-snowflake/blob/main/dbt/adapters/snowflake/connections.py):
-    ID-token caching depends on account policy and working local storage; adapter
-    versions already enable the connector's temporary-credential option.
+Diagnostics are best-effort and cannot replace a query outcome. State is HMAC-keyed
+per project, bounded to 20 failures/seven days, and pruned on next use. Persisted and
+shareable forms allowlist metadata independently. SQL, results, raw errors,
+environment, credentials, names, and paths are excluded. Normal dbt logs/artifacts
+remain outside this system and may contain SQL.
 
-## Validation and limits
+### Lifecycle is explicit and provenance-bound
 
-`tests/test_session.py` proves native compilation/freshness, retained handles and
-temporary tables, SQL-error recovery, rollback, fatal-error retirement, and physical
-teardown on representative patches of the admitted Core minors (stable 1.10.x and
-1.12.x, with private-API feature checks). The worker/helper suites cover private IPC, frozen-child
-deadlines, context/credential invalidation, no replay, and real DuckDB worker
-queries. An installed-wheel smoke also crosses a dbt-free Python 3.12 UI environment
-and a separate Python 3.10 project environment with no dbt-enhance installation.
+Setup records immutable provenance where possible. The Helix shell bridge requires
+explicit first-use/adoption consent and records the prior supported shell for
+conditional restoration. Existing bridge metadata/content and ownership properties
+are checked before setup overwrites or removal deletes it. Before tool installation
+or Helix publication, setup executes the candidate with isolated `uvx` to validate
+current settings schema, candidate version, and required bridge capability; it then
+checks that the persistent launcher reports the same version. An installed-version
+mismatch is an honestly reported partial installation, not an automatic rollback.
+Update/rollback perform the same settings/version checks and gate any retained
+bridge on a matching capability before package replacement, then recheck at apply.
+Removal excludes new worker admission while inventorying workers, removes only
+exact still-owned mappings and bridge state, then removes package/state and
+optionally preferences/diagnostics. An exact owned bridge can still be removed if
+the recorded config disappeared; user edits are preserved, while recognizable
+bindings with missing bridge metadata block ambiguous cleanup. It never edits dbt
+files. Open Helix instances must reload or restart after setup/removal. No operation
+checks for updates silently or resolves an implicit latest release.
 
-Real isolated DuckDB integration tests run Jinja macros and ephemeral `ref()`,
-check actual compiled SQL and its limit, preserve typed values, and cover empty
-results, database errors, terminal semicolons, trailing comments, existing LIMIT
-clauses with a smaller outer cap, and relation/column introspection on a cold cache.
-A repeated 14-column/10,000-row preview checks that a changed SQL selection produces
-fresh rows and compiled SQL while dbt reports `PartialParsingSkipParsing`. Other
-tests cover custom project/env artifact paths and rejection of stale run results.
-Core 1.10.22, 1.12.5, and 1.12.6 have been exercised locally. Test fixtures never use
-user profiles and clear inherited artifact-path overrides before local testing.
+## Transport and resource bounds
 
-`tests/test_snowflake_session.py` exercises native parsing, compilation, and the
-real Snowflake adapter's exception handler using a synthetic connector handle.
-It covers SQLSTATE 42S02, 42000, and 22012, cold/warm missing-ref and Jinja errors,
-plus closed-handle, health-check, and cleanup failures. Run it with `uv run --with dbt-snowflake python -m pytest
-tests/test_snowflake_session.py`. This is offline adapter-path coverage, not proof
-of live Snowflake connector/session retention. A live report of retirement after
-these SQL errors still requires the retirement reason and installed adapter/
-connector versions to diagnose.
+Setup replaces Helix's `editor.shell` only after `--helix-shell-bridge` consent.
+Bridge format/capability `2` is stored at the private filename
+`helix-shell-bridge-v2`. The mapping sends exactly this V3 command shape plus the
+raw buffer name:
 
-The optional terminal test creates a private tmux server, runs a real Helix
-instance with generated config, selects only one query line from a file containing
-invalid unselected SQL, opens the real popup, expands SQL, and checks the original
-file remains unchanged. It requires Helix/tmux on the test machine.
+```text
+) # DBT_ENHANCE_BUFFER_V3:<fingerprint> %{buffer_name}
+```
 
-In process mode, empty Agate JSON previews are `[]`, so column metadata is lost;
-the UI states this explicitly rather than guessing a schema. Worker mode reads
-column names directly from the native Agate table even when its rows are empty. The dbt event and
-artifact formats are validated; missing or incompatible output is an error, not
-an invented success. This protocol targets dbt Core, not Fusion or the Cloud CLI.
+The leading unmatched `)` deliberately causes a noninteractive shell parse error
+when an old/stale editor invokes the mapping without the bridge. It is not an
+`exec false`, `exit`, or overridable shell-function guard. On the active matching
+path, the bridge forwards the single command argument as opaque data to hidden
+`_helix`; the helper validates the exact shape and rejects empty names or CR/LF/NUL
+before popup launch. A stale or malformed `DBT_ENHANCE_BUFFER_*` namespace and a
+recognizable legacy dbt-enhance heredoc fail closed instead of reaching the prior
+shell.
 
-Local process-group cancellation is tested independently. On macOS, cleanup can
-receive `EPERM` from an already-exited group containing only zombies: XNU's
-[`killpg1` filter and `nfound` handling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)
-explain the behavior. A minimized local process probe and repeated real dbt runs
-reproduced it. Cleanup tolerates that error only on Darwin after confirming the
-leader has exited; regression tests preserve permission failures elsewhere.
-Regression fixtures also model unreapable processes, cleanup permission errors,
-hidden/EOF SSO prompts, late worker callbacks, and closing with a non-cooperative
-runner. A real local child ignoring SIGTERM must be killed before the popup exits.
-Those local fixtures do not themselves establish Snowflake/WSL behavior. The user
-subsequently verified installed commit `53f15e` on WSL with an empty SSO token cache
-and a forced browser callback wait: the UI showed a ticking 120-second deadline,
-then timeout at 120.0 seconds with SSO guidance; the dbt child was gone at the next
-sample. The original five-minute hang occurred on `e28e588` and is considered fixed
-by v0.1.1. This evidence validates the existing process backend, not the new
-worker's Snowflake connection lifetime or cancellation, which require separate
-remote validation despite worker now being the default.
-Cancellation cannot guarantee remote warehouse cancellation. Neither dbt compilation nor `show` is a read-only
-security boundary; trusted macros and least-privilege warehouse credentials are
-still required.
+Delegation is allowed only for a strict recorded `editor.shell`: exactly a
+recognized `sh`, `bash`, `dash`, `ash`, `ksh`, `mksh`, or `zsh` executable followed
+by `-c`; Bash may instead add exactly `--noprofile`, `--norc`, `--posix`, or
+`--noprofile --norc`; zsh may add exactly `-f`. An explicit executable path must be
+an executable file. The executable/PATH lookup and startup code still remain
+trusted. Startup customization that deliberately evaluates command text is outside
+the guarantee. This keeps matching buffer names out of evaluation; spaces, quotes,
+dollar signs, backticks, and Unicode remain data. Newline-containing filenames are
+unsupported. Popup handoff files and worker state use private permissions. Open
+editors can retain stale shell/mapping state until reload or restart.
+
+Selected SQL is limited to 1 MiB, process output to 16 MiB, worker frames/state and
+preflight responses have smaller explicit bounds, and UI deadlines are independent
+of backend cleanup. A daemon query thread prevents screen shutdown from waiting
+forever; OS/native-extension failure modes and remote warehouse cancellation remain
+outside a local UI guarantee.
+
+## Evidence and limitations
+
+Current code admits stable Core 1.10.x/1.12.x plus DuckDB/Snowflake metadata for
+native worker use, with private API feature checks. The packaged certification
+matrix is empty, so no admitted combination is certified. Historical local DuckDB
+benchmarks and regression evidence are documented in
+[persistent runner evidence](persistent-dbt-runner.md); they are not live
+Snowflake/WSL evidence or measurements of all current changes. External Snowflake
+and WSL proof, remote-cancellation proof, observations from 3–5 practitioners, and
+representative changed-code performance budgets remain pending. Repository-owned
+checks and measurements, without invented totals, belong in the
+[validation record](validation.md).
+
+Security boundaries and authentication guidance live in
+[troubleshooting](troubleshooting.md); policy and status live in
+[support](support.md).

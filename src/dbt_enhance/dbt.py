@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -16,12 +17,22 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
 from sqlparse import lexer, tokens
 
-from .models import SSO_GUIDANCE, SSO_STATUS, EnhanceError, QueryRequest, QueryResult
+from .models import (
+    SSO_GUIDANCE,
+    SSO_STATUS,
+    BackendChoiceRequired,
+    EnhanceError,
+    QueryRequest,
+    QueryResult,
+    QueryStatus,
+)
 
 _IS_DARWIN = sys.platform == "darwin"
 _MAX_SQL_BYTES = 1024 * 1024
@@ -108,6 +119,72 @@ def run_query(
     cancel: threading.Event | None = None,
     on_status: Callable[[str], None] | None = None,
 ) -> QueryResult:
+    """Execute once, with best-effort metadata-only diagnostics at the caller seam."""
+    started = time.monotonic()
+    try:
+        result = _execute_query(request, cancel, on_status)
+    except BackendChoiceRequired:
+        # Human selection is not a failed warehouse query and is never retried here.
+        raise
+    except EnhanceError as exc:
+        _record_diagnostic(request, time.monotonic() - started, error=exc)
+        raise
+    if isinstance(result, QueryResult):
+        _record_diagnostic(request, time.monotonic() - started, result=result)
+    return result
+
+
+def _record_diagnostic(
+    request: QueryRequest,
+    elapsed: float,
+    *,
+    result: QueryResult | None = None,
+    error: EnhanceError | None = None,
+) -> None:
+    """Optional local history must never replace the query's real outcome."""
+    if request.diagnostics is not True:
+        return
+    try:
+        from .diagnostics import DiagnosticStore
+
+        project = result.project_dir if result else discover_project(request.file)
+        code = error.code if error else None
+        outcome = "success" if error is None else "failure"
+        if code in {"timeout", "cancelled"}:
+            outcome = code
+        metadata = {
+            "outcome": outcome,
+            "reason": code,
+            "cancellation": getattr(error, "cancellation", None),
+            "stage": error.stage if error else "execution",
+            "backend": result.backend if result and result.backend else request.backend,
+            "support_status": result.support_tier if result else "unknown",
+            "platform": "macos"
+            if sys.platform == "darwin"
+            else "linux"
+            if sys.platform.startswith("linux")
+            else "other",
+            "versions": {
+                "tool": version("dbt-enhance"),
+                "python": platform.python_version(),
+                **(result.versions if result else {}),
+            },
+            "timings": {**(result.timings if result else {}), "total": elapsed},
+        }
+        store = DiagnosticStore()
+        if error is not None:
+            store.record_failure(project, metadata)
+        else:
+            store.record_latest(project, metadata)
+    except Exception:  # noqa: BLE001 - optional diagnostics cannot fail a query
+        pass
+
+
+def _execute_query(
+    request: QueryRequest,
+    cancel: threading.Event | None = None,
+    on_status: Callable[[str], None] | None = None,
+) -> QueryResult:
     """Compile and execute one inline query with dbt Core.
 
     All user-facing failures are raised as :class:`EnhanceError`. The request
@@ -116,13 +193,55 @@ def run_query(
     """
 
     _validate_request(request)
+    if request.backend == "auto":
+        from .preflight import resolve_context
+        from .support import select_backend
+
+        started = time.monotonic()
+        try:
+            context = resolve_context(request, cancel=cancel, on_status=on_status)
+        except EnhanceError as exc:
+            if exc.code != "unsupported_environment" or request.allowed_targets is not None:
+                raise
+            # No SQL was compiled or dispatched. An unverified interpreter can
+            # only be offered the explicit public process path, never a worker.
+            context = None
+        choice = select_backend("auto", context)
+        if context is not None:
+            _notify(
+                on_status,
+                QueryStatus(
+                    "Native target verified — selecting execution backend",
+                    stage="preflight",
+                    target=context.target,
+                    target_verified=True,
+                    backend="auto",
+                    support_tier=choice.tier,
+                ),
+            )
+        if choice.backend is None:
+            raise BackendChoiceRequired(choice.choices, context=context)
+        remaining = float(request.timeout) - (time.monotonic() - started)
+        if remaining <= 0:
+            raise EnhanceError(
+                "Query timed out during preflight.", code="timeout", stage="preflight"
+            )
+        request = replace(
+            request,
+            backend=choice.backend,
+            backend_origin="certified_default",
+            target=context.target if context is not None else request.target,
+            timeout=remaining,
+        )
     if request.backend == "worker":
         from .worker import run_query as run_worker_query
 
         return run_worker_query(request, cancel, on_status)
     cancel_event = cancel if cancel is not None else threading.Event()
     if cancel_event.is_set():
-        raise EnhanceError("Query was cancelled before dbt started.")
+        raise EnhanceError(
+            "Query was cancelled before dbt started.", code="cancelled", stage="preflight"
+        )
 
     project_dir = discover_project(request.file)
     marker = project_dir / "dbt_project.yml"
@@ -134,6 +253,38 @@ def run_query(
     _notify(on_status, "Running dbt query")
 
     try:
+        from .preflight import resolve_context
+        from .settings import check_target_allowed
+
+        try:
+            context = resolve_context(request, cancel=cancel_event, on_status=on_status)
+        except EnhanceError as exc:
+            # The public process escape hatch still supports custom wrappers and
+            # unadmitted Core lines, but NEVER when target proof is required.
+            if exc.code != "unsupported_environment" or request.allowed_targets is not None:
+                raise
+            context = None
+        if context is not None:
+            check_target_allowed(request.allowed_targets, project_dir, context.target)
+            # Pin the proven native target. A later default-target change cannot
+            # redirect this invocation under a previously approved name.
+            request = replace(request, target=context.target)
+            _notify(
+                on_status,
+                QueryStatus(
+                    "Native target verified — executing preview",
+                    stage="execution",
+                    target=context.target,
+                    target_verified=True,
+                    backend="process",
+                    support_tier="best-effort",
+                ),
+            )
+        remaining = float(request.timeout) - (time.monotonic() - started)
+        if remaining <= 0:
+            raise EnhanceError(
+                "Query timed out during preflight.", code="timeout", stage="preflight"
+            )
         # Let dbt resolve its normal artifact/cache paths, including project and
         # environment overrides. This reuses and updates partial_parse.msgpack.
         command = [
@@ -164,7 +315,7 @@ def run_query(
         return_code, output = _run_process(
             command,
             cwd=project_dir,
-            timeout=float(request.timeout),
+            timeout=remaining,
             cancel=cancel_event,
             on_status=on_status,
         )
@@ -189,6 +340,14 @@ def run_query(
             limit=request.limit,
             target=request.target,
             warnings=warnings,
+            target_verified=context is not None,
+            backend="process",
+            adapter=context.adapter if context else None,
+            support_tier="best-effort",
+            session_state="isolated",
+            versions=dict(context.versions) if context else {},
+            timings={"total": elapsed},
+            sql_provenance="process_run_results",
         )
     except EnhanceError:
         raise
@@ -238,31 +397,62 @@ def _preview_sql(sql: str) -> str:
 
 
 def _validate_request(request: QueryRequest) -> None:
-    if not isinstance(request.backend, str) or request.backend not in {"process", "worker"}:
-        raise EnhanceError("Query backend must be 'process' or 'worker'.")
+    def invalid(message: str) -> EnhanceError:
+        return EnhanceError(message, code="invalid_request", stage="preflight")
+
+    def valid_name(value: object) -> bool:
+        return isinstance(value, str) and bool(value) and not any(c in value for c in "\0\r\n")
+
+    if not isinstance(request.backend, str) or request.backend not in {"auto", "process", "worker"}:
+        raise invalid("Query backend must be 'auto', 'process', or 'worker'.")
     if not isinstance(request.sql, str) or not request.sql.strip():
-        raise EnhanceError("SQL must not be empty.")
+        raise invalid("SQL must not be empty.")
     try:
         sql_size = len(request.sql.encode("utf-8"))
     except UnicodeEncodeError:
-        raise EnhanceError("SQL must be valid UTF-8 text.") from None
+        raise invalid("SQL must be valid UTF-8 text.") from None
     if sql_size > _MAX_SQL_BYTES:
-        raise EnhanceError("SQL must not exceed 1 MiB when encoded as UTF-8.")
-    if (
-        isinstance(request.timeout, bool)
-        or not isinstance(request.timeout, (int, float))
-        or not math.isfinite(float(request.timeout))
-        or request.timeout <= 0
+        raise invalid("SQL must not exceed 1 MiB when encoded as UTF-8.")
+    for value, name in (
+        (request.timeout, "Query timeout"),
+        (request.worker_idle_seconds, "Worker idle timeout"),
     ):
-        raise EnhanceError("Query timeout must be a positive, finite number of seconds.")
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        try:
+            valid = valid and math.isfinite(float(value)) and value > 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise invalid(f"{name} must be a positive, finite number of seconds.")
+    if request.worker_idle_seconds > 86400:
+        raise invalid("Worker idle timeout must not exceed 86400 seconds.")
     if (
         isinstance(request.limit, bool)
         or not isinstance(request.limit, int)
         or not 1 <= request.limit <= 10_000
     ):
-        raise EnhanceError("Query limit must be an integer between 1 and 10000.")
+        raise invalid("Query limit must be an integer between 1 and 10000.")
     if not isinstance(request.file, Path):
-        raise EnhanceError("The source file must be provided as a pathlib.Path.")
+        raise invalid("The source file must be provided as a pathlib.Path.")
+    for value, name in (
+        (request.profiles_dir, "Profiles directory"),
+        (request.dbt, "dbt executable"),
+    ):
+        if value is not None and not isinstance(value, Path):
+            raise invalid(f"{name} must be a pathlib.Path or None.")
+    if request.target is not None and not valid_name(request.target):
+        raise invalid("Target must be a nonempty name without NUL or newlines.")
+    if request.allowed_targets is not None and (
+        not isinstance(request.allowed_targets, (tuple, list))
+        or not all(valid_name(target) for target in request.allowed_targets)
+    ):
+        raise invalid("Allowed targets must be a sequence of nonempty target names or None.")
+    if not isinstance(request.diagnostics, bool):
+        raise invalid("Diagnostics must be a boolean.")
+    if not isinstance(request.theme, str) or request.theme not in {"auto", "light", "dark"}:
+        raise invalid("Theme must be auto, light, or dark.")
+    if not valid_name(request.backend_origin):
+        raise invalid("Backend origin must be a nonempty name.")
 
 
 def _is_executable(path: Path) -> bool:
@@ -358,14 +548,14 @@ def _run_process(
     try:
         while process.poll() is None:
             if cancel.is_set():
-                raise EnhanceError("Query was cancelled.")
+                raise EnhanceError("Query was cancelled.", code="cancelled")
             if captured.overflowed():
-                raise EnhanceError(_OUTPUT_SIZE_ERROR)
+                raise EnhanceError(_OUTPUT_SIZE_ERROR, code="output_limit")
             if time.monotonic() >= deadline:
                 detail = f"dbt query timed out after {timeout:g} seconds."
                 if captured.sso_pending():
                     detail += "\n" + SSO_GUIDANCE
-                raise EnhanceError(detail)
+                raise EnhanceError(detail, code="timeout")
             if captured.sso_pending() and not sso_reported:
                 sso_reported = True
                 _notify(on_status, SSO_STATUS)
@@ -378,6 +568,17 @@ def _run_process(
         # A descendant can also keep stdout open; never close a BufferedReader
         # while its reader thread holds the internal lock.
         try:
+            if isinstance(failure, EnhanceError) and failure.code in {"cancelled", "timeout"}:
+                # dbt's public CLI handles KeyboardInterrupt by calling its
+                # adapter cancellation path. Give that request a short grace,
+                # then retain the independent TERM/KILL safety net. An accepted
+                # signal is NOT evidence that warehouse work actually stopped.
+                failure.cancellation = "requested_unverified"
+                try:
+                    _signal_group(process, signal.SIGINT)
+                    process.wait(timeout=0.25)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             _terminate_process_group(process)
         except (EnhanceError, OSError) as exc:
             if failure is None:
@@ -396,7 +597,7 @@ def _run_process(
             "process-group cleanup could not complete."
         )
     if captured.overflowed():
-        raise EnhanceError(_OUTPUT_SIZE_ERROR)
+        raise EnhanceError(_OUTPUT_SIZE_ERROR, code="output_limit")
 
     return process.returncode, captured.text()
 

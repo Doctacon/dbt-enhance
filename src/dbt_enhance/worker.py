@@ -12,6 +12,7 @@ import contextlib
 import fcntl
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -26,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 from ._wire import (
-    IDLE_SECONDS,
     MAX_REQUEST,
     PROTOCOL,
     Decoder,
@@ -43,12 +43,22 @@ from .dbt import (
     discover_project,
     find_dbt,
 )
-from .models import SSO_GUIDANCE, SSO_STATUS, EnhanceError, QueryRequest, QueryResult
+from .models import (
+    SSO_GUIDANCE,
+    SSO_STATUS,
+    EnhanceError,
+    QueryRequest,
+    QueryResult,
+    QueryStatus,
+)
 
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _STATE_LIMIT = 64 * 1024
 _POLL = 0.05
+_ADMISSION_FILE = "admission"
+_ADMISSION_BYTES = 65
+_ADMISSION_ERROR = "Package removal is in progress; retry the query after removal finishes."
 _HELPER = Path(__file__).with_name("_worker_helper.py")
 # These are ordinary pip/uv console-script bodies, not arbitrary Python wrappers.
 _ENTRY_POINTS = (
@@ -74,16 +84,37 @@ class _Deadline:
         self.end = time.monotonic() + seconds
         self.cancel = cancel or threading.Event()
         self.sso = False
+        self.execution_started = False
+        self.cancellation: str | None = None
+        self.failure_reason: str | None = None
 
     def remaining(self) -> float:
         if self.cancel.is_set():
-            raise EnhanceError("Query was cancelled.")
+            error = EnhanceError(
+                "Query was cancelled.",
+                code="cancelled",
+                stage="execution" if self.execution_started else "preflight",
+            )
+            if self.execution_started:
+                self.cancellation = "requested_unverified"
+                self.failure_reason = "client_disconnect"
+                error.cancellation = self.cancellation
+            raise error
         remaining = self.end - time.monotonic()
         if remaining <= 0:
             message = f"dbt query timed out after {self.seconds:g} seconds."
             if self.sso:
                 message += "\n" + SSO_GUIDANCE
-            raise EnhanceError(message)
+            error = EnhanceError(
+                message,
+                code="timeout",
+                stage="execution" if self.execution_started else "preflight",
+            )
+            if self.execution_started:
+                self.cancellation = "requested_unverified"
+                self.failure_reason = "timeout"
+                error.cancellation = self.cancellation
+            raise error
         return remaining
 
     def pause(self) -> None:
@@ -154,6 +185,130 @@ def _lock(path: Path, deadline: _Deadline) -> Iterator[None]:
         os.close(fd)
 
 
+def _admission_epoch(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, _ADMISSION_BYTES + 1)
+    if (
+        len(data) != _ADMISSION_BYTES
+        or data[-1:] != b"\n"
+        or _HEX64.fullmatch(data[:-1].decode("ascii", "ignore")) is None
+    ):
+        raise EnhanceError(
+            "Invalid worker admission registry; inspect the private runtime directory."
+        )
+    return data[:-1].decode("ascii")
+
+
+def _write_admission_epoch(fd: int) -> None:
+    data = memoryview((secrets.token_hex(32) + "\n").encode("ascii"))
+    os.lseek(fd, 0, os.SEEK_SET)
+    while data:
+        written = os.write(fd, data)
+        if written <= 0:
+            raise OSError("Could not update worker admission registry.")
+        data = data[written:]
+    os.ftruncate(fd, _ADMISSION_BYTES)
+    os.fsync(fd)
+
+
+def _ensure_admission_locked(root: Path) -> int:
+    """Open the persistent lock inode while the registry lock is held."""
+    fd = _private_open(root / _ADMISSION_FILE, os.O_RDWR | os.O_CREAT)
+    try:
+        if os.fstat(fd).st_size == 0:
+            _write_admission_epoch(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_admission(deadline: _Deadline) -> int:
+    root = _runtime_root(create=True)
+    assert root is not None
+    with _lock(root / "lock", deadline):
+        return _ensure_admission_locked(root)
+
+
+def _admission_snapshot(deadline: _Deadline) -> str:
+    fd = _open_admission(deadline)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise EnhanceError(_ADMISSION_ERROR, stage="preflight") from None
+        return _admission_epoch(fd)
+    finally:
+        os.close(fd)
+
+
+def _admit(expected: str, deadline: _Deadline) -> int:
+    """Acquire shared admission without waiting behind package removal."""
+    deadline.remaining()
+    fd = _open_admission(deadline)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise EnhanceError(_ADMISSION_ERROR, stage="preflight") from None
+        if _admission_epoch(fd) != expected:
+            raise EnhanceError(
+                "This queued query predates package removal and was not executed; retry it.",
+                stage="preflight",
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class _RemovalGuard:
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._invalidated = False
+
+    def invalidate(self) -> None:
+        """Reject requests queued before this removal reached irreversible effects."""
+        if self._invalidated:
+            return
+        _write_admission_epoch(self._fd)
+        self._invalidated = True
+
+
+@contextlib.contextmanager
+def removal_guard(*, seconds: float = 2.0) -> Iterator[_RemovalGuard]:
+    """Exclude new query admission for a bounded package-removal critical section.
+
+    Accepted queries hold no registry lock while executing, so callers can inventory
+    and either preserve them or explicitly reset them while this guard is held.
+    """
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(float(seconds))
+        or seconds <= 0
+    ):
+        raise ValueError("removal guard timeout must be a positive finite number")
+    deadline = _Deadline(float(seconds))
+    fd = _open_admission(deadline)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline.end:
+                    raise EnhanceError(
+                        "Package removal could not start because a query is still being admitted; "
+                        "retry removal after worker startup finishes."
+                    ) from None
+                time.sleep(min(_POLL, max(0.0, deadline.end - time.monotonic())))
+        _admission_epoch(fd)
+        yield _RemovalGuard(fd)
+    finally:
+        os.close(fd)
+
+
 def _read(path: Path) -> bytes:
     with os.fdopen(_private_open(path, os.O_RDONLY), "rb") as handle:
         data = handle.read(_STATE_LIMIT + 1)
@@ -182,6 +337,8 @@ def _slot(project: Path, deadline: _Deadline, *, create: bool) -> tuple[Path, by
     if root is None:
         return None
     with _lock(root / "lock", deadline):
+        admission_fd = _ensure_admission_locked(root)
+        os.close(admission_fd)
         key_path = root / "key"
         try:
             key = _read(key_path)
@@ -225,14 +382,20 @@ def project_python(dbt: Path) -> Path:
     except (OSError, ValueError, SyntaxError, IndexError):
         raise EnhanceError(
             "Worker mode requires an ordinary dbt Core Python console script with an absolute "
-            "interpreter path. Use --backend process for shell/custom wrappers."
+            "interpreter path. Use --backend process for shell/custom wrappers.",
+            code="unsupported_environment",
+            stage="preflight",
         ) from None
     # Resolving this symlink would discard its virtualenv and import the wrong dbt.
     return interpreter.absolute()
 
 
 def _valid_last_retirement(value: object) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or set(value) != {"reason", "session_pid"}:
+    if (
+        not isinstance(value, dict)
+        or not set(value).issubset({"reason", "session_pid", "cancellation"})
+        or not {"reason", "session_pid"}.issubset(value)
+    ):
         return None
     reason = validate_retirement_reason(value.get("reason"))
     session_pid = value.get("session_pid")
@@ -243,7 +406,13 @@ def _valid_last_retirement(value: object) -> dict[str, Any] | None:
         or session_pid <= 0
     ):
         return None
-    return {"reason": reason, "session_pid": session_pid}
+    result: dict[str, Any] = {"reason": reason, "session_pid": session_pid}
+    cancellation = value.get("cancellation")
+    if cancellation is not None:
+        if cancellation != "requested_unverified":
+            return None
+        result["cancellation"] = cancellation
+    return result
 
 
 def _record(directory: Path) -> dict[str, Any] | None:
@@ -274,13 +443,21 @@ def _record(directory: Path) -> dict[str, Any] | None:
     return data
 
 
-def _persist_retirement(directory: Path, record: dict[str, Any], retirement_reason: object) -> None:
-    """Persist only a fixed reason and the current native session PID."""
+def _persist_retirement(
+    directory: Path,
+    record: dict[str, Any],
+    retirement_reason: object,
+    cancellation: object = None,
+) -> None:
+    """Persist only fixed retirement and cancellation certainty codes."""
     session_pid = record.get("session_pid")
     if not isinstance(session_pid, int) or isinstance(session_pid, bool) or session_pid <= 0:
         return
     reason = validate_retirement_reason(retirement_reason) or "worker_failure"
-    record["last_retirement"] = {"reason": reason, "session_pid": session_pid}
+    retired: dict[str, Any] = {"reason": reason, "session_pid": session_pid}
+    if cancellation == "requested_unverified":
+        retired["cancellation"] = cancellation
+    record["last_retirement"] = retired
     _write_state(directory / "control.json", record)
 
 
@@ -345,6 +522,8 @@ def _generation(
                 "python": str(interpreter),
                 "target": request.target,
                 "profiles_dir": str(request.profiles_dir) if request.profiles_dir else None,
+                "allowed_targets": request.allowed_targets,
+                "worker_idle_seconds": request.worker_idle_seconds,
                 "environment": environment,
             },
             sort_keys=True,
@@ -476,6 +655,18 @@ def _stop_record(directory: Path, record: dict[str, Any], seconds: float = 2.0) 
         while True:
             response = _receive(sock, decoder, deadline)
             if response.get("type") == "stopped":
+                retired = _valid_last_retirement(record.get("last_retirement"))
+                if response.get("cancellation") == "requested_unverified" and (
+                    retired is None
+                    or retired.get("session_pid") != record.get("session_pid")
+                    or retired.get("cancellation") is None
+                ):
+                    _persist_retirement(
+                        directory,
+                        record,
+                        "worker_failure",
+                        "requested_unverified",
+                    )
                 return True
             if response.get("type") == "error":
                 raise EnhanceError(str(response.get("message", "Worker could not stop.")))
@@ -488,6 +679,7 @@ def _spawn(
     interpreter: Path,
     environment: dict[str, str],
     deadline: _Deadline,
+    idle_seconds: float,
     last_retirement: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], subprocess.Popen]:
     record = {
@@ -495,6 +687,7 @@ def _spawn(
         "instance": secrets.token_hex(16),
         "token": secrets.token_hex(32),
         "generation": generation,
+        "project": context["project_dir"],
         "watched": [],
     }
     validated_retirement = _valid_last_retirement(last_retirement)
@@ -507,7 +700,7 @@ def _spawn(
             "token": record["token"],
             "directory": str(directory),
             "context": context,
-            "idle_seconds": IDLE_SECONDS,
+            "idle_seconds": idle_seconds,
         }
     ).encode()
     if len(bootstrap) > _STATE_LIMIT:
@@ -633,9 +826,24 @@ def run_query(
     on_status: Callable[[str], None] | None = None,
 ) -> QueryResult:
     _validate_request(request)
+    if request.allowed_targets is not None and (
+        not isinstance(request.allowed_targets, (tuple, list))
+        or not all(isinstance(item, str) for item in request.allowed_targets)
+    ):
+        raise EnhanceError("Allowed targets must be a sequence of target names or None.")
+    if (
+        isinstance(request.worker_idle_seconds, bool)
+        or not isinstance(request.worker_idle_seconds, (int, float))
+        or not math.isfinite(float(request.worker_idle_seconds))
+        or request.worker_idle_seconds <= 0
+    ):
+        raise EnhanceError("Worker idle timeout must be a positive, finite number of seconds.")
     started = time.monotonic()
     deadline = _Deadline(float(request.timeout), cancel)
     deadline.remaining()
+    # Linearize this request against removal before project discovery or any
+    # potentially slow preflight. The epoch is checked again after queueing.
+    admission_epoch = _admission_snapshot(deadline)
     project = discover_project(request.file)
     dbt = find_dbt(project, request.dbt)
     interpreter = project_python(dbt)
@@ -646,6 +854,9 @@ def run_query(
         "profiles_dir": str((project / request.profiles_dir.expanduser()).absolute())
         if request.profiles_dir is not None
         else None,
+        "allowed_targets": (
+            list(request.allowed_targets) if request.allowed_targets is not None else None
+        ),
     }
     sock = None
     record = None
@@ -666,6 +877,14 @@ def run_query(
         ):
             # Finish retirement before releasing the project lock. Otherwise the
             # next query could race a dying worker or receive a spurious busy error.
+            if deadline.cancellation is not None:
+                with contextlib.suppress(Exception):
+                    _persist_retirement(
+                        directory,
+                        record,
+                        deadline.failure_reason,
+                        deadline.cancellation,
+                    )
             with contextlib.suppress(Exception):
                 _stop_record(directory, record)
             if process is not None and process.poll() is None:
@@ -676,8 +895,41 @@ def run_query(
         located = _slot(project, deadline, create=True)
         assert located is not None
         directory, key = located
-        _notify(on_status, "Waiting for project worker")
-        with _lock(directory / "lock", deadline), contextlib.ExitStack() as cleanup:
+        lock_path = directory / "lock"
+        lock_fd = _private_open(lock_path, os.O_RDWR | os.O_CREAT)
+        queued = False
+        try:
+            while True:
+                deadline.remaining()
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not queued:
+                        queued = True
+                        _notify(
+                            on_status,
+                            QueryStatus(
+                                "Queued for project worker",
+                                stage="queued",
+                                backend="worker",
+                            ),
+                        )
+                    deadline.pause()
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(os.close, lock_fd)
+            admission_fd: int | None = _admit(admission_epoch, deadline)
+
+            def release_admission() -> None:
+                nonlocal admission_fd
+                if admission_fd is not None:
+                    os.close(admission_fd)
+                    admission_fd = None
+
+            cleanup.callback(release_admission)
             cleanup.callback(finish)
             generation = _generation(project, dbt, interpreter, request, environment, key)
             record = _record(directory)
@@ -704,6 +956,7 @@ def run_query(
                     interpreter,
                     environment,
                     deadline,
+                    float(request.worker_idle_seconds),
                     last_retirement,
                 )
                 sock, ready, decoder = _open_worker(directory, record, process, deadline)
@@ -712,8 +965,12 @@ def run_query(
             record["versions"] = ready.get("versions", {})
             _write_state(directory / "control.json", record)
             request_id = secrets.token_hex(16)
-            _notify(on_status, "Running query on project worker")
+            _notify(
+                on_status,
+                QueryStatus("Running query on project worker", stage="execution", backend="worker"),
+            )
             execution_sent = True  # Even a partial send makes retry unsafe.
+            deadline.execution_started = True
             _send(
                 sock,
                 {
@@ -725,17 +982,49 @@ def run_query(
                 },
                 deadline,
             )
+            resolved_context: dict[str, Any] | None = None
             while True:
                 message = _receive(sock, decoder, deadline)
                 if message.get("request_id") != request_id:
                     raise EnhanceError("Worker returned a result for a different query.")
                 kind = message.get("type")
                 if kind == "accepted":
+                    # The supervisor marks the request active before acknowledging.
+                    # Removal can now inventory it without query execution retaining
+                    # a global lock.
+                    release_admission()
                     continue
                 if kind == "progress":
                     if message.get("status") == "sso":
                         deadline.sso = True
                         _notify(on_status, SSO_STATUS)
+                    elif message.get("status") == "running":
+                        _notify(
+                            on_status,
+                            QueryStatus(
+                                "Native dbt request running",
+                                stage="compilation",
+                                backend="worker",
+                            ),
+                        )
+                    continue
+                if kind == "context":
+                    candidate = message.get("context")
+                    if not _valid_native_context(candidate):
+                        raise EnhanceError("Worker returned malformed native context metadata.")
+                    resolved_context = candidate
+                    _notify(
+                        on_status,
+                        QueryStatus(
+                            "Native target "
+                            f"{candidate['target']} verified ({candidate['adapter']})",
+                            stage="preflight",
+                            target=candidate["target"],
+                            target_verified=True,
+                            backend="worker",
+                            support_tier="provisional",
+                        ),
+                    )
                     continue
                 if kind == "error":
                     if message.get("reusable") is True:
@@ -749,11 +1038,24 @@ def run_query(
                         deadline.remaining()
                         session_reusable = True
                     else:
-                        _persist_retirement(directory, record, message.get("retirement_reason"))
+                        _persist_retirement(
+                            directory,
+                            record,
+                            message.get("retirement_reason"),
+                            message.get("cancellation"),
+                        )
                     detail = str(message.get("message", "Worker query failed."))[:8000]
                     if message.get("sso") or deadline.sso:
                         detail = SSO_GUIDANCE
-                    raise EnhanceError(detail)
+                    denied = message.get("code") == "target_not_allowed"
+                    error = EnhanceError(
+                        detail,
+                        code="target_not_allowed" if denied else "query_failed",
+                        stage="preflight" if denied else "execution",
+                    )
+                    if message.get("cancellation") == "requested_unverified":
+                        error.cancellation = "requested_unverified"
+                    raise error
                 if kind != "result":
                     raise EnhanceError("Worker returned an unexpected response.")
                 result = message.get("result")
@@ -764,6 +1066,10 @@ def run_query(
                 deadline.remaining()
                 elapsed = time.monotonic() - started
                 session_reusable = True
+                native = _native_result_context(result)
+                if native is not None:
+                    if resolved_context is not None and native != resolved_context:
+                        raise EnhanceError("Worker native context changed during the request.")
                 return QueryResult(
                     columns=result["columns"],
                     rows=result["rows"],
@@ -772,10 +1078,54 @@ def run_query(
                     elapsed=elapsed,
                     project_dir=project,
                     limit=request.limit,
-                    target=request.target,
+                    target=native["target"] if native is not None else request.target,
+                    column_types=result.get("column_types", []),
+                    target_verified=native is not None,
+                    backend="worker",
+                    adapter=native["adapter"] if native is not None else None,
+                    support_tier="provisional",
+                    session_state="ready",
+                    versions=(
+                        native["versions"] if native is not None else ready.get("versions", {})
+                    ),
+                    sql_provenance=result.get("sql_provenance"),
                 )
+    except EnhanceError:
+        raise
     except (OSError, ValueError, WireError) as exc:
-        raise EnhanceError(f"Project worker failed: {exc}. The query was not retried.") from None
+        error = EnhanceError(f"Project worker failed: {exc}. The query was not retried.")
+        raise error from None
+
+
+_VALUE_KINDS = frozenset({"unknown", "text", "boolean", "number", "date", "datetime", "time"})
+_NATIVE_RESULT_KEYS = frozenset({"target", "target_verified", "adapter", "versions"})
+
+
+def _valid_native_context(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _NATIVE_RESULT_KEYS
+        and isinstance(value.get("target"), str)
+        and bool(value["target"])
+        and value.get("target_verified") is True
+        and isinstance(value.get("adapter"), str)
+        and bool(value["adapter"])
+        and isinstance(value.get("versions"), dict)
+        and all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in value["versions"].items()
+        )
+    )
+
+
+def _native_result_context(result: dict[str, Any]) -> dict[str, Any] | None:
+    present = _NATIVE_RESULT_KEYS.intersection(result)
+    if not present:
+        return None
+    if present != _NATIVE_RESULT_KEYS:
+        return None
+    value = {key: result[key] for key in _NATIVE_RESULT_KEYS}
+    return value if _valid_native_context(value) else None
 
 
 def _valid_result(result: Any, limit: int) -> bool:
@@ -784,7 +1134,7 @@ def _valid_result(result: Any, limit: int) -> bool:
     columns, rows, sql, warnings = (
         result.get(key) for key in ("columns", "rows", "compiled_sql", "warnings")
     )
-    return (
+    legacy_valid = (
         isinstance(columns, list)
         and all(isinstance(column, str) for column in columns)
         and isinstance(rows, list)
@@ -795,12 +1145,30 @@ def _valid_result(result: Any, limit: int) -> bool:
         and isinstance(warnings, list)
         and all(isinstance(warning, str) for warning in warnings)
     )
+    if not legacy_valid:
+        return False
+    native_present = _NATIVE_RESULT_KEYS.intersection(result)
+    if native_present and _native_result_context(result) is None:
+        return False
+    column_types = result.get("column_types", [])
+    if "column_types" in result and (
+        not isinstance(column_types, list)
+        or len(column_types) != len(columns)
+        or not all(isinstance(kind, str) and kind in _VALUE_KINDS for kind in column_types)
+    ):
+        return False
+    provenance = result.get("sql_provenance")
+    if "sql_provenance" in result and provenance != "worker_native_result":
+        return False
+    return True
 
 
-def status(project: Path) -> dict[str, Any] | None:
-    """Inspect an existing worker without launching dbt or reading profiles."""
+def inspect_worker(project: Path) -> dict[str, Any] | None:
+    """Authenticate to a worker and return live supervisor-owned metadata."""
+
+    canonical = project.resolve()
     deadline = _Deadline(1.0)
-    located = _slot(project, deadline, create=False)
+    located = _slot(canonical, deadline, create=False)
     if located is None:
         return None
     directory, _ = located
@@ -809,10 +1177,62 @@ def status(project: Path) -> dict[str, Any] | None:
         return None
     try:
         with _connect(directory, record) as sock:
-            ready, _ = _ready(sock, record, deadline)
+            decoder = Decoder()
+            _hello(sock, record, deadline)
+            ready = _receive(sock, decoder, deadline)
+            if ready.get("type") not in {"starting", "ready"}:
+                if ready.get("type") == "error":
+                    raise EnhanceError(str(ready.get("message", "Worker could not start.")))
+                raise EnhanceError("Worker handshake did not match this installation.")
+            if ready.get("protocol") != PROTOCOL or ready.get("instance") != record["instance"]:
+                raise EnhanceError("Worker handshake did not match this installation.")
     except (FileNotFoundError, ConnectionRefusedError, ConnectionError):
         return None
-    return {key: ready.get(key) for key in ("pid", "session_pid", "versions")}
+    state = ready.get("state")
+    idle_seconds = ready.get("idle_seconds")
+    idle_remaining = ready.get("idle_remaining")
+    versions = ready.get("versions")
+    pid = ready.get("pid")
+    session_pid = ready.get("session_pid")
+    if (
+        state not in {"starting", "ready", "active"}
+        or not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(session_pid, int)
+        or isinstance(session_pid, bool)
+        or session_pid <= 0
+        or not isinstance(idle_seconds, (int, float))
+        or isinstance(idle_seconds, bool)
+        or not math.isfinite(float(idle_seconds))
+        or not isinstance(versions, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in versions.items()
+        )
+        or (idle_remaining is not None and not isinstance(idle_remaining, (int, float)))
+    ):
+        raise EnhanceError("Worker returned malformed lifecycle metadata.")
+    active = state != "ready"
+    return {
+        "project": canonical,
+        "state": state,
+        "status": "active" if active else "idle",
+        "active": active,
+        "idle_seconds": float(idle_seconds),
+        "idle_remaining": float(idle_remaining) if idle_remaining is not None else None,
+        "versions": dict(versions),
+        "pid": pid,
+        "session_pid": session_pid,
+    }
+
+
+def status(project: Path) -> dict[str, Any] | None:
+    """Legacy worker status shape, preserved for compatibility."""
+
+    information = inspect_worker(project)
+    if information is None:
+        return None
+    return {key: information[key] for key in ("pid", "session_pid", "versions")}
 
 
 def retirement_status(project: Path) -> dict[str, Any] | None:
@@ -825,6 +1245,147 @@ def retirement_status(project: Path) -> dict[str, Any] | None:
     if record is None:
         return None
     return _valid_last_retirement(record.get("last_retirement"))
+
+
+def _lifecycle_command(
+    project: Path, command: dict[str, Any], success: str, seconds: float = 2.0
+) -> bool:
+    located = _slot(project.resolve(), _Deadline(seconds), create=False)
+    if located is None:
+        return False
+    directory, _ = located
+    record = _record(directory)
+    if record is None:
+        return False
+    deadline = _Deadline(seconds)
+    try:
+        sock = _connect(directory, record)
+    except (FileNotFoundError, ConnectionRefusedError):
+        return False
+    with sock:
+        _hello(sock, record, deadline)
+        _send(sock, command, deadline)
+        decoder = Decoder()
+        while True:
+            response = _receive(sock, decoder, deadline)
+            if response.get("type") == success:
+                retired = _valid_last_retirement(record.get("last_retirement"))
+                if response.get("cancellation") == "requested_unverified" and (
+                    retired is None
+                    or retired.get("session_pid") != record.get("session_pid")
+                    or retired.get("cancellation") is None
+                ):
+                    _persist_retirement(
+                        directory,
+                        record,
+                        "worker_failure",
+                        "requested_unverified",
+                    )
+                return True
+            if response.get("type") == "error":
+                if response.get("code") == "worker_active":
+                    return False
+                raise EnhanceError(str(response.get("message", "Worker lifecycle command failed.")))
+
+
+def _inert_slot(directory: Path) -> bool:
+    """Recognize only slots that cannot describe or accept worker traffic."""
+    entries = list(directory.iterdir())
+    if not entries:
+        return True
+    if len(entries) == 1 and entries[0].name == "lock":
+        fd = _private_open(entries[0], os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+        finally:
+            os.close(fd)
+    return False
+
+
+def inventory() -> tuple[dict[str, Any], ...]:
+    """Return authenticated workers, failing closed on ambiguous owned slots."""
+
+    root = _runtime_root(create=False)
+    if root is None:
+        return ()
+    workers: list[dict[str, Any]] = []
+    for directory in root.iterdir():
+        if not directory.name or directory.name in {"key", "lock", _ADMISSION_FILE}:
+            continue
+        try:
+            if not _private_directory(directory, create=False):
+                raise EnhanceError(f"Unexpected worker registry entry: {directory}")
+            try:
+                record = _record(directory)
+            except EnhanceError as exc:
+                raise EnhanceError(
+                    f"Cannot safely inspect owned worker slot {directory.name}: {exc} "
+                    "Package removal is blocked; inspect the private runtime directory."
+                ) from exc
+            if record is None:
+                if _inert_slot(directory):
+                    continue
+                raise EnhanceError(
+                    f"Owned worker slot {directory.name} has no authenticated state but is not "
+                    "empty. Package removal is blocked; inspect the private runtime directory."
+                )
+            project_value = record.get("project")
+            if not isinstance(project_value, str) or not os.path.isabs(project_value):
+                raise EnhanceError(
+                    f"Owned worker slot {directory.name} has no valid project identity; "
+                    "package removal is blocked."
+                )
+            project = Path(project_value)
+            located = _slot(project, _Deadline(1.0), create=False)
+            if located is None or located[0] != directory:
+                raise EnhanceError(
+                    f"Owned worker slot {directory.name} does not match its project identity; "
+                    "package removal is blocked."
+                )
+            # A valid authenticated record whose private socket is gone/refused is
+            # stale. Every other handshake, authentication, or timeout failure is
+            # actionable and must block removal rather than hide a possible worker.
+            try:
+                information = inspect_worker(project)
+            except EnhanceError as exc:
+                raise EnhanceError(
+                    f"Could not authenticate or inspect owned worker slot {directory.name}: "
+                    f"{exc} Package removal is blocked; retry or inspect the private runtime "
+                    "directory."
+                ) from exc
+            if information is not None:
+                workers.append(information)
+        except EnhanceError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise EnhanceError(
+                f"Cannot safely inspect owned worker slot {directory.name}: {exc}. "
+                "Package removal is blocked; inspect the private runtime directory."
+            ) from exc
+    workers.sort(key=lambda item: str(item["project"]))
+    return tuple(workers)
+
+
+def reset(project: Path, *, allow_active: bool = False) -> bool:
+    """Retire a worker; active work is preserved unless explicitly allowed."""
+
+    if not isinstance(allow_active, bool):
+        raise TypeError("allow_active must be a bool")
+    return _lifecycle_command(
+        project,
+        {"type": "reset", "allow_active": allow_active},
+        "reset",
+    )
+
+
+def disconnect(project: Path) -> bool:
+    """Disconnect only an idle worker, checked atomically by its supervisor."""
+
+    return _lifecycle_command(project, {"type": "disconnect"}, "disconnected")
 
 
 def stop(project: Path) -> bool:

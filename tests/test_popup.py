@@ -56,7 +56,16 @@ def test_failed_popup_also_cleans_request(tmp_path, monkeypatch):
 
 def test_handoff_preserves_credentials_but_uses_popup_terminal(tmp_path, monkeypatch):
     path = tmp_path / "request.json"
-    data = asdict(QueryRequest("select 1", tmp_path / "orders.sql"))
+    data = asdict(
+        QueryRequest(
+            "select 1",
+            tmp_path / "orders.sql",
+            allowed_targets=("dev",),
+            worker_idle_seconds=37,
+            diagnostics=False,
+            theme="light",
+        )
+    )
     data["file"] = str(data["file"])
     path.write_text(
         json.dumps(
@@ -74,8 +83,25 @@ def test_handoff_preserves_credentials_but_uses_popup_terminal(tmp_path, monkeyp
     result = popup.read_request(path, consume=True)
     assert result.file == tmp_path / "orders.sql"
     assert result.backend == "worker"
+    assert result.allowed_targets == ("dev",)
+    assert result.worker_idle_seconds == 37
+    assert result.diagnostics is False
+    assert result.theme == "light"
     assert not path.exists()
     assert os.environ == {"TERM": "popup-term", "PATH": "/editor/bin", "MY_PASSWORD": "secret"}
+
+
+@pytest.mark.parametrize("invalid", [{"allowed_targets": "dev"}, {"theme": []}])
+def test_invalid_handoff_does_not_replace_environment(tmp_path, monkeypatch, invalid):
+    path = tmp_path / "request.json"
+    data = asdict(QueryRequest("select 1", tmp_path / "orders.sql"))
+    data["file"] = str(data["file"])
+    data.update(invalid)
+    path.write_text(json.dumps({"request": data, "environment": {"REPLACED": "yes"}}))
+    monkeypatch.setattr(os, "environ", {"ORIGINAL": "yes"})
+    with pytest.raises(EnhanceError):
+        popup.read_request(path, consume=True)
+    assert os.environ == {"ORIGINAL": "yes"}
 
 
 def test_no_tmux_has_actionable_error(monkeypatch):

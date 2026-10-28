@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -186,6 +188,65 @@ def test_same_context_reuses_session_and_stop_closes_it(setup_worker):
     assert worker.status(alias) == information
     assert worker.stop(alias)
     assert (project / f"closed-{first.rows[0][0]}").exists()
+
+
+def test_worker_inspection_inventory_idle_identity_and_disconnect(setup_worker):
+    project, request = setup_worker
+    first = worker.run_query(request)
+    information = worker.inspect_worker(project)
+    assert information is not None
+    assert information["project"] == project.resolve()
+    assert information["state"] == "ready"
+    assert information["idle_seconds"] == 600.0
+    assert information["idle_remaining"] <= 600.0
+    assert information["session_pid"] == first.rows[0][0]
+    inventory = worker.inventory()
+    assert len(inventory) == 1
+    assert inventory[0]["project"] == information["project"]
+    assert inventory[0]["session_pid"] == information["session_pid"]
+
+    changed = worker.run_query(replace(request, worker_idle_seconds=30.0))
+    assert changed.rows[0][0] != first.rows[0][0]
+    assert worker.inspect_worker(project)["idle_seconds"] == 30.0
+    assert worker.disconnect(project) is True
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and worker.inspect_worker(project) is not None:
+        time.sleep(0.01)
+    assert worker.inspect_worker(project) is None
+    assert worker.disconnect(project) is False
+
+
+def test_idle_only_lifecycle_commands_are_checked_by_supervisor(setup_worker):
+    project, request = setup_worker
+    worker.run_query(request)
+    outcome = []
+
+    def execute():
+        try:
+            worker.run_query(replace(request, sql="sleep"))
+        except EnhanceError as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        information = worker.inspect_worker(project)
+        if information is not None and information["state"] == "active":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("worker did not become active")
+    assert worker.disconnect(project) is False
+    assert worker.reset(project) is False
+    assert worker.reset(project, allow_active=True) is True
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert getattr(outcome[0], "cancellation", None) == "requested_unverified"
+    retired = worker.retirement_status(project)
+    assert retired["cancellation"] == "requested_unverified"
+    assert retired["session_pid"] > 0
 
 
 def test_worker_environment_preserves_arbitrary_profile_inputs(tmp_path, monkeypatch):
@@ -470,11 +531,25 @@ def test_timeout_retires_worker_and_next_request_recovers(setup_worker):
     _, request = setup_worker
     before = worker.run_query(request)
     started = time.monotonic()
-    with pytest.raises(EnhanceError, match="timed out"):
+    with pytest.raises(EnhanceError, match="timed out") as raised:
         worker.run_query(replace(request, sql="sleep", timeout=0.3))
+    assert raised.value.code == "timeout"
+    assert raised.value.stage == "execution"
+    assert raised.value.cancellation == "requested_unverified"
     assert time.monotonic() - started < 3
     after = worker.run_query(request)
     assert after.rows[0][0] != before.rows[0][0]
+
+
+def test_pre_execution_cancellation_has_safe_diagnostic_metadata(setup_worker):
+    _, request = setup_worker
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(EnhanceError, match="cancelled") as raised:
+        worker.run_query(request, cancel)
+    assert raised.value.code == "cancelled"
+    assert raised.value.stage == "preflight"
+    assert not hasattr(raised.value, "cancellation")
 
 
 def test_explicit_cancellation_returns_and_retires_session(setup_worker):
@@ -484,21 +559,143 @@ def test_explicit_cancellation_returns_and_retires_session(setup_worker):
     timer = threading.Timer(0.3, cancel.set)
     timer.start()
     try:
-        with pytest.raises(EnhanceError, match="cancelled"):
+        with pytest.raises(EnhanceError, match="cancelled") as raised:
             worker.run_query(replace(request, sql="sleep"), cancel)
     finally:
         timer.cancel()
+    assert raised.value.code == "cancelled"
+    assert raised.value.stage == "execution"
+    assert raised.value.cancellation == "requested_unverified"
     assert worker.run_query(request).rows[0][0] != before.rows[0][0]
 
 
 def test_lock_wait_shares_deadline_without_killing_other_query(setup_worker):
     project, request = setup_worker
+    uncontended = []
+    before = worker.run_query(request, on_status=uncontended.append)
+    assert not any(getattr(item, "stage", None) == "queued" for item in uncontended)
+    directory, _ = worker._slot(project.resolve(), worker._Deadline(2), create=False)
+    queued = []
+    with worker._lock(directory / "lock", worker._Deadline(2)):
+        with pytest.raises(EnhanceError, match="timed out") as raised:
+            worker.run_query(replace(request, timeout=0.2), on_status=queued.append)
+    assert raised.value.code == "timeout"
+    assert raised.value.stage == "preflight"
+    assert not hasattr(raised.value, "cancellation")
+    assert any(getattr(item, "stage", None) == "queued" for item in queued)
+    assert worker.run_query(request).rows[0][0] == before.rows[0][0]
+
+
+def test_exclusive_removal_guard_rejects_new_query_before_worker_start(setup_worker):
+    project, request = setup_worker
+    with worker.removal_guard():
+        with pytest.raises(EnhanceError, match="removal is in progress"):
+            worker.run_query(request)
+        assert worker.inspect_worker(project) is None
+
+
+def test_removal_guard_wait_for_starting_admission_is_bounded():
+    deadline = worker._Deadline(2)
+    epoch = worker._admission_snapshot(deadline)
+    admission = worker._admit(epoch, deadline)
+    started = time.monotonic()
+    try:
+        with pytest.raises(EnhanceError, match="query is still being admitted"):
+            with worker.removal_guard(seconds=0.1):
+                pytest.fail("exclusive guard entered while shared admission was held")
+    finally:
+        os.close(admission)
+    assert time.monotonic() - started < 1
+
+
+def test_queued_query_is_rejected_after_removal_epoch_changes(setup_worker):
+    project, request = setup_worker
     before = worker.run_query(request)
     directory, _ = worker._slot(project.resolve(), worker._Deadline(2), create=False)
+    queued = threading.Event()
+    outcome = []
+
+    def status(value):
+        if getattr(value, "stage", None) == "queued":
+            queued.set()
+
+    def execute():
+        try:
+            worker.run_query(request, on_status=status)
+        except EnhanceError as exc:
+            outcome.append(exc)
+
     with worker._lock(directory / "lock", worker._Deadline(2)):
-        with pytest.raises(EnhanceError, match="timed out"):
-            worker.run_query(replace(request, timeout=0.2))
-    assert worker.run_query(request).rows[0][0] == before.rows[0][0]
+        thread = threading.Thread(target=execute)
+        thread.start()
+        assert queued.wait(2), "request never joined the project queue"
+        with worker.removal_guard() as guard:
+            guard.invalidate()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert "predates package removal" in str(outcome[0])
+    after = worker.run_query(request)
+    assert after.rows[0][0] == before.rows[0][0]
+    assert after.rows[0][1] == 2, "the stale queued request must not send SQL"
+
+
+def test_removal_preserves_unconfirmed_active_query_and_confirmed_reset_blocks_admission(
+    setup_worker, tmp_path
+):
+    from dbt_enhance.lifecycle import apply_remove, preview_remove
+
+    project, request = setup_worker
+    worker.run_query(request)
+    active_outcome = []
+
+    def execute_active():
+        try:
+            worker.run_query(replace(request, sql="sleep"))
+        except EnhanceError as exc:
+            active_outcome.append(exc)
+
+    thread = threading.Thread(target=execute_active)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        information = worker.inspect_worker(project)
+        if information is not None and information["active"]:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("worker did not become active")
+
+    plan = preview_remove(state_root=tmp_path / "lifecycle")
+    commands = []
+    admission_errors = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        try:
+            worker.run_query(request)
+        except EnhanceError as exc:
+            admission_errors.append(exc)
+        else:
+            pytest.fail("query entered while removal held exclusive admission")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(EnhanceError, match="Active workers block"):
+        apply_remove(plan, runner=runner)
+    assert commands == []
+    assert thread.is_alive(), "unconfirmed removal must not interrupt active work"
+    assert worker.inspect_worker(project)["active"] is True
+
+    result = apply_remove(plan, allow_active=True, runner=runner)
+    assert result.ok
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert len(active_outcome) == 1
+    assert active_outcome[0].cancellation == "requested_unverified"
+    assert commands == [["uv", "tool", "uninstall", "dbt-enhance"]]
+    assert len(admission_errors) == 1
+    assert "removal is in progress" in str(admission_errors[0])
+    assert worker.inspect_worker(project) is None
 
 
 def test_worker_state_and_arguments_never_store_editor_secrets_or_sql(setup_worker, monkeypatch):
@@ -527,6 +724,21 @@ def test_sso_progress_is_safe_and_timeout_actionable(setup_worker):
     assert any("SSO" in value for value in progress)
     assert "dbt debug" in str(error.value)
     assert "DO_NOT_FORWARD" not in " ".join(progress) + str(error.value)
+
+
+def test_inventory_blocks_malformed_owned_slot_with_live_socket(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    directory, _ = worker._slot(project, worker._Deadline(2), create=True)
+    (directory / "control.json").write_text("{malformed")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(directory / "s-uninspectable"))
+        listener.listen()
+        with pytest.raises(EnhanceError, match="Package removal is blocked"):
+            worker.inventory()
+    finally:
+        listener.close()
 
 
 def test_private_state_rejects_symlinks_and_insecure_permissions(tmp_path):

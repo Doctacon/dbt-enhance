@@ -11,6 +11,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import struct
 import subprocess
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from dbt_enhance.helix import install_config
+from dbt_enhance.helix import install_config, remove_owned_binding
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DBT_ENHANCE_EDITOR_SMOKE") != "1"
@@ -48,7 +49,14 @@ def test_selected_jinja_reaches_popup_without_changing_buffer(tmp_path: Path):
     original = "select {{ 6 * 7 }} as selected_value\nthis is deliberately invalid SQL\n"
     model.write_text(original)
     config = tmp_path / "config.toml"
-    install_config(config, [sys.executable, "-m", "dbt_enhance"])
+    config.write_text('[editor]\nshell = ["/bin/sh", "-c"]\n')
+    state_root = tmp_path / "state"
+    install_config(
+        config,
+        [sys.executable, "-m", "dbt_enhance"],
+        state_root=state_root,
+        helix_shell_bridge=True,
+    )
     socket = f"dbt-enhance-test-{uuid.uuid4().hex}"
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
@@ -150,6 +158,13 @@ def test_selected_jinja_reaches_popup_without_changing_buffer(tmp_path: Path):
                     break
         process.wait(timeout=2)
         assert model.read_text() == original
+        remove_owned_binding(
+            config,
+            [sys.executable, "-m", "dbt_enhance"],
+            state_root=state_root,
+        )
+        assert 'shell = ["/bin/sh", "-c"]' in config.read_text()
+        assert not (state_root / "helix-shell-bridge-v2").exists()
     finally:
         subprocess.run(["tmux", "-L", socket, "kill-server"], capture_output=True, check=False)
         os.close(master)
@@ -160,3 +175,102 @@ def test_selected_jinja_reaches_popup_without_changing_buffer(tmp_path: Path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+
+
+def test_newline_filename_exploit_never_reaches_shell_popup_or_query(tmp_path: Path):
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    marker = tmp_path / "OWNED"
+    popup_marker = tmp_path / "POPUP"
+    query_marker = tmp_path / "QUERY"
+    # The payload can only create a marker in this test's private working directory.
+    malicious = tmp_path / (f"model.sql\nDBT_ENHANCE_FILE_{'1' * 32}\ntouch OWNED")
+    malicious.write_text("select 1\n")
+
+    config = tmp_path / "config.toml"
+    state_root = tmp_path / "state"
+    install_config(
+        config,
+        [sys.executable, "-m", "dbt_enhance"],
+        state_root=state_root,
+        helix_shell_bridge=True,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/bin/sh\n"
+        f"case \" $* \" in *' display-popup '*) touch {shlex.quote(str(popup_marker))} ;; esac\n"
+        f'exec {shlex.quote(real_tmux)} "$@"\n'
+    )
+    fake_tmux.chmod(0o700)
+    fake_dbt = fake_bin / "dbt"
+    fake_dbt.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(query_marker))}\nexit 99\n")
+    fake_dbt.chmod(0o700)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "TERM": "xterm-256color",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "XDG_RUNTIME_DIR": str(runtime),
+        "DBT_ENHANCE_DBT": str(fake_dbt),
+        "DBT_SEND_ANONYMOUS_USAGE_STATS": "false",
+    }
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    socket = f"dbt-enhance-exploit-{uuid.uuid4().hex}"
+    target = "exploit"
+    try:
+        started = subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "exploit",
+                "-x",
+                "120",
+                "-y",
+                "30",
+                "hx",
+                "-c",
+                str(config),
+                str(malicious),
+            ],
+            env=environment,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert started.returncode == 0, started.stderr
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            pane = subprocess.run(
+                [real_tmux, "-L", socket, "capture-pane", "-p", "-t", target],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if "select 1" in pane.stdout:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"malicious Helix buffer did not open: {pane.stdout}\n{pane.stderr}")
+        subprocess.run(
+            [real_tmux, "-L", socket, "send-keys", "-t", target, "-l", "x x"],
+            check=True,
+        )
+        time.sleep(3)
+        assert not marker.exists()
+        assert not popup_marker.exists()
+        assert not query_marker.exists()
+    finally:
+        subprocess.run([real_tmux, "-L", socket, "kill-server"], capture_output=True, check=False)

@@ -1,9 +1,15 @@
 # Persistent dbt process and connection reuse
 
-Status: the **persistent worker is the default in this checkout**;
-`--backend process` opts out. Native lifecycle tests have passed on Core **1.10.22**,
-**1.12.5**, and **1.12.6** with local DuckDB. No live Snowflake/WSL worker validation or release is
-claimed. The original process-only experiment below remains separate evidence.
+Status: the **persistent worker remains the legacy built-in default** in this
+Unreleased checkout; this preserves compatibility and is not a certification claim.
+`--backend process` explicitly opts out, while `--backend auto` opts into the
+certification-gated selection policy. The packaged support matrix has no
+certification rows. Earlier native lifecycle runs covered Core **1.10.22**,
+**1.12.5**, and **1.12.6** with local DuckDB, but no live Snowflake/WSL worker
+validation, tagged release, or changed-code performance validation is claimed. The
+original experiments below are historical evidence. The repository
+[validation record](validation.md) will contain actual final checks and measurements
+without turning these historical numbers into current budgets.
 
 ## Recommendation
 
@@ -26,12 +32,16 @@ Its ordinary invocation lifecycle resets adapters and cleans up connections.
 Do not describe this as connection pooling or assume `client_session_keep_alive`
 or `reuse_connections` will preserve connections across those invocations.
 
-## Measured process-reuse experiment
+## Historical process-reuse experiment
 
-The [reproducible probe](benchmarks/dbt_process_reuse.py) compares the current
+The numbers in this section predate the current roadmap changes. They are retained
+for reproducibility and design context, not as measurements of changed code,
+release evidence, hard latency budgets, or certification.
+
+The [reproducible probe](benchmarks/dbt_process_reuse.py) compared the then-current
 subprocess runner with sequential `dbtRunner.invoke()` calls in one process. It
-uses identical CLI arguments, JSON preview parsing, compiled-SQL artifact checks,
-and an already-warm partial-parse cache. There is no injected in-memory manifest.
+used identical CLI arguments, JSON preview parsing, compiled-SQL artifact checks,
+and an already-warm partial-parse cache. There was no injected in-memory manifest.
 
 Local macOS, Python 3.12.7, dbt-duckdb 1.9.6, one ephemeral fixture model, three
 samples per workload; numbers below are medians:
@@ -86,12 +96,13 @@ Compiled SQL and typed rows come from the native result; empty-result column nam
 are retained without writing JSON result/manifest artifacts. Normal partial-parse
 cache and log paths remain authoritative.
 
-Support admits stable patches in **Core 1.10.x and 1.12.x**, including **1.12.5**.
-Other minor lines, prereleases, and suffixed builds are rejected. Startup still
-feature-detects the required private APIs. Historical regression measurements use
-Core 1.10.22 and 1.12.6 with dbt-duckdb 1.9.6; admission does not imply every patch
-was individually tested. The updated session/recovery/worker suite also passes on
-Core **1.12.5**. The regression suite covers:
+Native preflight technically admits stable patches in **Core 1.10.x and 1.12.x**,
+including **1.12.5**, when paired with admitted stable adapter metadata. Other minor
+lines, prereleases, and suffixed builds are rejected. Startup still feature-detects
+the required private APIs. Admission is not certification and does not imply every
+patch was individually tested. Historical regression measurements use Core 1.10.22
+and 1.12.6 with dbt-duckdb 1.9.6; an earlier session/recovery/worker suite also
+passed on Core **1.12.5**. Those historical checks covered:
 
 - Native compilation/execution, changed selections, edited models/macros/sources,
   fresh invocation IDs/times, preview limits, and empty-result columns.
@@ -132,6 +143,10 @@ fallback. Normal stop/timeout is handled by the separate supervisor on both OSes
 Local process death still does not establish remote warehouse cancellation.
 
 ## Transport-inclusive worker benchmark
+
+The numbers in this section predate the current roadmap changes. They are retained
+for reproducibility and design context, not as measurements of the changed code,
+release evidence, hard latency budgets, or certification.
 
 The [worker benchmark](benchmarks/dbt_worker.py) uses the public `run_query`
 backend seam, including worker startup, authenticated IPC, result decoding, and
@@ -202,8 +217,9 @@ progress callback, and `QueryResult`. The default worker implementation owns:
    explicit busy response. Never let different requests mutate dbt globals in
    parallel. Separate project/profile/target/credential contexts must not share a
    live connection accidentally.
-3. **An owned connection lifecycle.** Retain a healthy session for an idle period
-   (ten minutes), close it on expiry, and start fresh when necessary.
+3. **An owned connection lifecycle.** Retain a healthy session for a configurable
+   idle period (600 seconds by default; positive and at most 86,400 seconds), close
+   it on expiry, and start fresh when necessary.
    dbt-enhance never retries a query after an uncertain disconnect: it may already
    have executed, and trusted dbt macros can have side effects. Native adapter or
    connector retry policies still apply.
@@ -223,11 +239,14 @@ progress callback, and `QueryResult`. The default worker implementation owns:
    stale sockets/crashes can be replaced before a new execution is sent. A failure
    after sending SQL is never automatically retried.
 
-Acceptance should include real Snowflake RSA-auth tests on WSL: separate timings
-for worker startup, compilation, connection/authentication, execution/fetch, and UI
-rendering; evidence that the same warehouse session is actually reused; expiry
-and credential rotation; errors/cancellation; repeated requests without leaking
-threads/file descriptors; and project/target switching without stale state.
+External acceptance still needs real Snowflake non-interactive-auth tests on WSL:
+separate timings for worker startup, compilation, connection/authentication,
+execution/fetch, and UI rendering; evidence that the same warehouse session is
+actually reused; expiry and credential rotation; errors/cancellation; repeated
+requests without leaking threads/file descriptors; and project/target switching
+without stale state. Remote cancellation must be reported as observed behavior, not
+inferred from local process exit. Representative changed-code performance budgets
+and observations from 3–5 practitioners also remain pending.
 
 ## Primary evidence
 

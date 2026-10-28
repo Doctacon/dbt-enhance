@@ -257,6 +257,8 @@ def test_query_errors_recover_but_output_cap_retires(tmp_path: Path) -> None:
         # An error in an explicit transaction must roll back without closing it.
         failed._adapter.connections.begin()
         assert connection.transaction_open
+        # Prove actual rollback, not just dbt's transaction_open bookkeeping.
+        handle.cursor().execute("insert into failed_session_marker values (2)")
         try:
             failed.execute("select * from relation_that_does_not_exist", 2)
         except QueryError as error:

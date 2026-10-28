@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "certifications": [],
+  "goals": [
+    "Add rows only after release-artifact automation and real-environment evidence both exist."
+  ],
+  "documentation_notes": [
+    "An absent row means provisional or unsupported, never certified.",
+    "Each row matches one exact platform category, architecture, OS reference, native Python, dbt Core patch, adapter patch, backend, and dbt-enhance release identifier.",
+    "The packaged matrix is local and immutable at runtime; release policy never performs remote or calendar-triggered promotion."
+  ]
+}

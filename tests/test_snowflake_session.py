@@ -18,6 +18,8 @@ pytest.importorskip("dbt.adapters.snowflake")
         ("42000", "closed", "connection_not_open"),
         ("42000", "probe", "recovery_check_failed"),
         ("42000", "cleanup", "request_cleanup_failed"),
+        ("42000", "native_rollback", "request_cleanup_failed"),
+        ("42000", "adapter_rollback", "request_cleanup_failed"),
     ],
 )
 def test_snowflake_native_query_error_preserves_handle(tmp_path, sqlstate, gate, reason):
@@ -46,6 +48,8 @@ def test_snowflake_native_query_error_preserves_handle(tmp_path, sqlstate, gate,
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 
+expected_reason = {reason!r}
+
 class Cursor:
     sqlstate = None
     sfqid = "offline-query"
@@ -53,6 +57,10 @@ class Cursor:
     description = [("VALUE",)]
     def execute(self, sql, bindings=None):
         if "bad_query" in sql:
+            if {gate!r} == "adapter_rollback":
+                # A native adapter may suppress its own rollback failure before
+                # the session sees the original SQL error. Observe its event.
+                session._adapter.connections.rollback_if_open()
             if {gate!r} == "closed":
                 handles[0].closed = True
             raise ProgrammingError(msg="synthetic SQL error", errno=1003, sqlstate={sqlstate!r})
@@ -72,6 +80,8 @@ class Handle:
         self.closed = True
     def rollback(self):
         assert not self.closed
+        if {gate!r} in {{"native_rollback", "adapter_rollback"}}:
+            raise RuntimeError("synthetic native rollback failure")
 
 handles = []
 def connect(**kwargs):
@@ -102,17 +112,21 @@ try:
         session._connection_is_open = failed_check
     if {gate!r} == "cleanup":
         session._rollback_open_transaction = failed_check
+    if {gate!r} in {{"native_rollback", "adapter_rollback"}}:
+        # Snowflake's begin() is intentionally a no-op. Exercise a tracked
+        # transaction with a native SDK rollback failure, not that no-op.
+        session._adapter.connections.get_thread_connection().transaction_open = True
     try:
         session.execute("select bad_query", 2)
     except QueryError:
-        assert {reason!r} is None
+        assert expected_reason is None
     except SessionError as error:
-        assert {reason!r} is not None
-        assert error.reason == {reason!r}
+        assert expected_reason is not None
+        assert error.reason == expected_reason
         assert session._closed
     else:
         raise AssertionError("expected query error")
-    if {reason!r} is None:
+    if expected_reason is None:
         assert session.execute("select 1 as value", 2)["rows"] == [[1]]
         assert len(handles) == 1 and not handles[0].closed
 finally:

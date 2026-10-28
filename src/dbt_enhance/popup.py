@@ -89,7 +89,15 @@ def read_request(path: Path, *, consume: bool = False) -> QueryRequest:
         for key in ("file", "profiles_dir", "dbt"):
             if data[key] is not None:
                 data[key] = Path(data[key])
+        policy = data.get("allowed_targets")
+        if policy is not None:
+            if not isinstance(policy, list):
+                raise ValueError("allowed_targets must be an array of target names")
+            data["allowed_targets"] = tuple(policy)
         request = QueryRequest(**data)
+        from dbt_enhance.dbt import _validate_request
+
+        _validate_request(request)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise EnhanceError(f"Invalid popup request: {exc}") from exc
     if consume:

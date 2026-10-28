@@ -191,6 +191,137 @@ def test_find_dbt_invalid_override_is_actionable(tmp_path: Path) -> None:
         find_dbt(tmp_path, tmp_path / "missing")
 
 
+def test_auto_policy_requests_choice_before_any_selected_sql_executes(tmp_path, monkeypatch):
+    from dbt_enhance import dbt as dbt_module
+    from dbt_enhance import preflight, worker
+    from dbt_enhance.models import BackendChoiceRequired, ResolvedContext
+
+    project, source = _make_project(tmp_path, "auto-project")
+    context = ResolvedContext(
+        project,
+        tmp_path / "dbt",
+        Path(sys.executable),
+        "dev",
+        "duckdb",
+        {"dbt_core": "1.12.6", "dbt_duckdb": "1.9.6", "python": "3.12.7"},
+    )
+    monkeypatch.setattr(preflight, "resolve_context", lambda *a, **k: context)
+    monkeypatch.setattr(worker, "run_query", lambda *a, **k: pytest.fail("worker executed SQL"))
+    monkeypatch.setattr(
+        dbt_module, "_run_process", lambda *a, **k: pytest.fail("process executed SQL")
+    )
+    statuses = []
+    with pytest.raises(BackendChoiceRequired) as raised:
+        run_query(
+            QueryRequest(sql="select 1", file=source, backend="auto"),
+            on_status=statuses.append,
+        )
+    assert raised.value.choices == ("worker", "process")
+    assert raised.value.context == context
+    assert statuses[-1].target == "dev"
+    assert statuses[-1].target_verified is True
+
+
+def test_process_allowlist_rejects_native_target_before_execution(tmp_path, monkeypatch):
+    from dbt_enhance import dbt as dbt_module
+    from dbt_enhance import preflight
+    from dbt_enhance.models import ResolvedContext
+
+    project, source = _make_project(tmp_path, "guarded-project")
+    executable = _make_fake_dbt(tmp_path)
+    context = ResolvedContext(project, executable, Path(sys.executable), "prod", "duckdb")
+    monkeypatch.setattr(preflight, "resolve_context", lambda *a, **k: context)
+    monkeypatch.setattr(
+        dbt_module, "_run_process", lambda *a, **k: pytest.fail("denied SQL executed")
+    )
+    with pytest.raises(EnhanceError) as raised:
+        run_query(
+            QueryRequest(
+                sql="select 1",
+                file=source,
+                dbt=executable,
+                backend="process",
+                allowed_targets=("dev",),
+            )
+        )
+    assert raised.value.code == "target_not_allowed"
+
+
+def test_query_failure_records_only_safe_operational_metadata(tmp_path, monkeypatch):
+    from dbt_enhance import worker
+    from dbt_enhance.diagnostics import DiagnosticStore, build_shareable_report
+
+    project, source = _make_project(tmp_path, "private-client-project")
+
+    def fail(*args, **kwargs):
+        raise EnhanceError("SELECT secret_password FROM private_table", code="sql_error")
+
+    monkeypatch.setattr(worker, "run_query", fail)
+    with pytest.raises(EnhanceError, match="secret_password"):
+        run_query(QueryRequest(sql="select 'PRIVATE-SQL'", file=source, target="private-target"))
+    store = DiagnosticStore()
+    failures = store.failures(project)
+    assert len(failures) == 1
+    assert failures[0]["reason"] == "sql_error"
+    report = json.dumps(build_shareable_report(store.latest(project), failures))
+    for secret in ("PRIVATE-SQL", "secret_password", "private-client-project", "private-target"):
+        assert secret not in report
+
+
+def test_cancellation_diagnostics_preserve_unverified_remote_certainty(tmp_path, monkeypatch):
+    from dbt_enhance import worker
+    from dbt_enhance.diagnostics import DiagnosticStore
+
+    project, source = _make_project(tmp_path, "cancelled-project")
+
+    def fail(*_args, **_kwargs):
+        error = EnhanceError("private native error", code="cancelled")
+        error.cancellation = "requested_unverified"
+        raise error
+
+    monkeypatch.setattr(worker, "run_query", fail)
+    with pytest.raises(EnhanceError):
+        run_query(QueryRequest(sql="select 'private SQL'", file=source))
+    latest = DiagnosticStore().latest(project)
+    assert latest["outcome"] == "cancelled"
+    assert latest["cancellation"] == "requested_unverified"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"allowed_targets": "dev"},
+        {"allowed_targets": [""]},
+        {"allowed_targets": [{}]},
+        {"worker_idle_seconds": True},
+        {"worker_idle_seconds": 0},
+        {"worker_idle_seconds": float("inf")},
+        {"worker_idle_seconds": 86401},
+        {"diagnostics": "false"},
+        {"theme": []},
+        {"theme": "neon"},
+        {"backend_origin": []},
+        {"target": {}},
+        {"profiles_dir": "not-a-path-object"},
+        {"dbt": "not-a-path-object"},
+        pytest.param({"timeout": 10**1000}, id="overflowing-timeout"),
+    ],
+)
+def test_extended_request_contract_rejects_invalid_values_before_dispatch(
+    tmp_path, monkeypatch, overrides
+):
+    from dbt_enhance import worker
+
+    monkeypatch.setattr(
+        worker, "run_query", lambda *a, **k: pytest.fail("invalid query dispatched")
+    )
+    request = QueryRequest(sql="select 1", file=tmp_path / "model.sql", **overrides)
+    with pytest.raises(EnhanceError) as error:
+        run_query(request)
+    assert error.value.code == "invalid_request"
+    assert error.value.stage == "preflight"
+
+
 def test_run_query_dispatches_to_worker_by_default(tmp_path: Path, monkeypatch) -> None:
     from dbt_enhance import worker
 
@@ -470,6 +601,47 @@ def test_missing_artifact_never_reuses_a_previous_query_file(tmp_path):
     with pytest.raises(EnhanceError, match="did not report a run_results.json"):
         run_query(QueryRequest(sql="NO_ARTIFACT", file=source, dbt=dbt, backend="process"))
     assert artifact.read_bytes() == before
+
+
+def test_process_cancellation_requests_native_interrupt_without_claiming_remote_success(tmp_path):
+    project, source = _make_project(tmp_path, "cancel-project")
+    executable = tmp_path / "interruptible-dbt"
+    ready = tmp_path / "ready"
+    interrupted = tmp_path / "interrupted"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import signal, sys, time\nfrom pathlib import Path\n"
+        "def stop(signum, frame):\n"
+        f"    Path({str(interrupted)!r}).write_text('requested')\n"
+        "    sys.exit(130)\n"
+        "signal.signal(signal.SIGINT, stop)\n"
+        f"Path({str(ready)!r}).write_text('ready')\n"
+        "while True: time.sleep(1)\n"
+    )
+    executable.chmod(0o700)
+    cancel = threading.Event()
+
+    def request_cancel():
+        until = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        cancel.set()
+
+    trigger = threading.Thread(target=request_cancel, daemon=True)
+    trigger.start()
+    try:
+        with pytest.raises(EnhanceError) as raised:
+            run_query(
+                QueryRequest(
+                    sql="select 1", file=source, dbt=executable, backend="process", timeout=5
+                ),
+                cancel=cancel,
+            )
+        assert raised.value.code == "cancelled"
+        assert raised.value.cancellation == "requested_unverified"
+        assert interrupted.read_text() == "requested"
+    finally:
+        trigger.join(timeout=3)
 
 
 def test_cancellation_returns_quickly(tmp_path: Path) -> None:

@@ -29,6 +29,7 @@ def main() -> None:
         if key.startswith("DBT_"):
             del os.environ[key]
     os.environ["DBT_POPULATE_CACHE"] = "false"
+    os.environ["DBT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
     os.environ["PYTHON_DOTENV_DISABLED"] = "1"
     executable = Path(sys.executable).parent / "dbt"
     if not executable.is_file():
@@ -48,6 +49,14 @@ def main() -> None:
     ):
         os.environ["XDG_RUNTIME_DIR"] = runtime
         project = Path(root).resolve()
+        for variable, name in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_STATE_HOME", "state"),
+        ):
+            directory = project / name
+            directory.mkdir()
+            os.environ[variable] = str(directory)
         profiles = project / "profiles"
         profiles.mkdir()
         (project / "dbt_project.yml").write_text(
@@ -68,6 +77,8 @@ def main() -> None:
             target="dev",
             limit=10000,
             timeout=60,
+            backend="process",  # Warm disk state without retaining DuckDB's writer lock.
+            diagnostics=False,  # Disposable benchmark projects are not user history.
         )
 
         def sample(backend: str, workload: str) -> dict:

@@ -10,9 +10,11 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import hmac
+import inspect
 import json
 import math
 import os
+import queue
 import re
 import selectors
 import signal
@@ -130,6 +132,7 @@ def _validate_bootstrap(value: dict[str, Any]) -> tuple[Path, str, str, dict[str
     project_dir = context.get("project_dir")
     profiles_dir = context.get("profiles_dir")
     target = context.get("target")
+    allowed_targets = context.get("allowed_targets")
     if not isinstance(project_dir, str) or not os.path.isabs(project_dir):
         raise ValueError("Worker project directory must be absolute.")
     if profiles_dir is not None and (
@@ -138,6 +141,11 @@ def _validate_bootstrap(value: dict[str, Any]) -> tuple[Path, str, str, dict[str
         raise ValueError("Worker profiles directory must be absolute or null.")
     if target is not None and not isinstance(target, str):
         raise ValueError("Worker target must be a string or null.")
+    if allowed_targets is not None and (
+        not isinstance(allowed_targets, list)
+        or not all(isinstance(item, str) for item in allowed_targets)
+    ):
+        raise ValueError("Worker allowed targets must be a list of strings or null.")
     if (
         isinstance(idle, bool)
         or not isinstance(idle, (int, float))
@@ -244,6 +252,15 @@ def _child_scrub(error: object, session_module: Any) -> str:
             return "Native dbt session failed safely."
 
 
+def _child_error_code(error: BaseException, session_module: Any) -> str | None:
+    try:
+        if isinstance(error, session_module.TargetNotAllowed):
+            return "target_not_allowed"
+    except Exception:
+        pass
+    return None
+
+
 def _child_retirement_reason(error: BaseException, session_module: Any) -> str:
     """Classify a fatal child error without reflecting exception-controlled text."""
     is_session_error = False
@@ -334,10 +351,45 @@ def _session_main(fd_text: str) -> int:
                 snapshots.setdefault(item["path"], item)
             watched = [snapshots[path] for path in sorted(snapshots)]
 
-        dbt_session = session_module.DbtSession(context, on_config=on_config)
+        def on_context(resolved: dict[str, Any]) -> None:
+            _child_send(sock, {"type": "context", "context": resolved})
+
+        options: dict[str, Any] = {"on_config": on_config}
+        if "on_context" in inspect.signature(session_module.DbtSession).parameters:
+            options["on_context"] = on_context
+        dbt_session = session_module.DbtSession(context, **options)
         _child_send(sock, {"type": "ready", "versions": versions})
+        commands: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def receive_commands() -> None:
+            try:
+                while True:
+                    command = _blocking_receive(sock, decoder)
+                    if command is None:
+                        commands.put(None)
+                        return
+                    if command.get("type") == "cancel":
+                        # Cancellation is the sole adapter operation allowed off
+                        # the native execution thread. Never wait for a connector.
+                        cancel_method = getattr(dbt_session, "cancel_open_connections", None)
+                        if callable(cancel_method):
+                            threading.Thread(
+                                target=cancel_method,
+                                name="native-cancel",
+                                daemon=True,
+                            ).start()
+                        continue
+                    commands.put(command)
+            except BaseException:
+                commands.put(None)
+
+        threading.Thread(
+            target=receive_commands,
+            name="session-control",
+            daemon=True,
+        ).start()
         while True:
-            command = _blocking_receive(sock, decoder)
+            command = commands.get()
             if command is None:
                 return 0
             kind = command.get("type")
@@ -397,6 +449,11 @@ def _session_main(fd_text: str) -> int:
                     "type": "error",
                     "message": _child_scrub(error, session_module),
                     "retirement_reason": _child_retirement_reason(error, session_module),
+                    **(
+                        {"code": code}
+                        if (code := _child_error_code(error, session_module)) is not None
+                        else {}
+                    ),
                 },
             )
         except BaseException:
@@ -460,6 +517,7 @@ class _Supervisor:
         self.pending_command: dict[str, Any] | None = None
         self.exit_deadline: float | None = None
         self.startup_error: str | None = None
+        self.cancellation: str | None = None
 
     def _bind(self) -> None:
         if self.socket_path.exists() or self.socket_path.is_symlink():
@@ -548,7 +606,11 @@ class _Supervisor:
 
     def _close_client(self, client: _Client) -> None:
         if self.active is client and self.state == "active":
-            self._retire("Active client disconnected.", retirement_reason="client_disconnect")
+            self._retire(
+                "Active client disconnected.",
+                retirement_reason="client_disconnect",
+                cancel_active=True,
+            )
         fd = client.sock.fileno()
         try:
             self.selector.unregister(client.sock)
@@ -599,7 +661,18 @@ class _Supervisor:
         self.had_authenticated_client = True
         if self.state == "starting":
             self._queue(
-                client, {"type": "starting", "protocol": PROTOCOL, "instance": self.instance}
+                client,
+                {
+                    "type": "starting",
+                    "protocol": PROTOCOL,
+                    "instance": self.instance,
+                    "pid": os.getpid(),
+                    "session_pid": self.child.pid if self.child is not None else None,
+                    "versions": {},
+                    "state": "starting",
+                    "idle_seconds": self.idle_seconds,
+                    "idle_remaining": None,
+                },
             )
         elif self.state == "ready":
             self._send_ready(client)
@@ -617,6 +690,13 @@ class _Supervisor:
                 "pid": os.getpid(),
                 "session_pid": self.child.pid,
                 "versions": self.versions,
+                "state": self.state,
+                "idle_seconds": self.idle_seconds,
+                "idle_remaining": (
+                    max(0.0, self.idle_deadline - time.monotonic())
+                    if self.state == "ready"
+                    else None
+                ),
             },
         )
 
@@ -662,9 +742,56 @@ class _Supervisor:
             self._retire("Malformed authenticated worker request.", offender=client)
             return
         client.command_seen = True
-        if message.get("type") == "stop":
-            self._queue(client, {"type": "stopped"}, close=True)
-            self._retire("Worker was stopped.", stopped_by=client)
+        command_type = message.get("type")
+        if command_type == "stop":
+            was_active = self.state == "active"
+            self._queue(
+                client,
+                {
+                    "type": "stopped",
+                    **({"cancellation": "requested_unverified"} if was_active else {}),
+                },
+                close=True,
+            )
+            self._retire("Worker was stopped.", stopped_by=client, cancel_active=was_active)
+            return
+        if command_type == "disconnect":
+            if self.state != "ready":
+                self._queue(
+                    client,
+                    {"type": "error", "code": "worker_active", "message": "Worker is active."},
+                    close=True,
+                )
+                return
+            self._queue(client, {"type": "disconnected"}, close=True)
+            self._retire("Idle worker disconnected.", stopped_by=client)
+            return
+        if command_type == "reset":
+            allow_active = message.get("allow_active")
+            if not isinstance(allow_active, bool):
+                self._queue(
+                    client,
+                    {"type": "error", "message": "Malformed worker request."},
+                    close=True,
+                )
+                return
+            if self.state != "ready" and not allow_active:
+                self._queue(
+                    client,
+                    {"type": "error", "code": "worker_active", "message": "Worker is active."},
+                    close=True,
+                )
+                return
+            was_active = self.state == "active"
+            self._queue(
+                client,
+                {
+                    "type": "reset",
+                    **({"cancellation": "requested_unverified"} if was_active else {}),
+                },
+                close=True,
+            )
+            self._retire("Worker was reset.", stopped_by=client, cancel_active=was_active)
             return
         valid, request_id = self._valid_request(message)
         if not valid:
@@ -813,6 +940,17 @@ class _Supervisor:
         if self.state != "active":
             self._retire("Native dbt session sent an unexpected response.")
             return
+        if kind == "context" and isinstance(message.get("context"), dict):
+            assert self.active is not None
+            self._queue(
+                self.active,
+                {
+                    "type": "context",
+                    "request_id": self.request_id,
+                    "context": message["context"],
+                },
+            )
+            return
         if (
             kind == "result"
             and message.get("request_id") == self.request_id
@@ -854,7 +992,12 @@ class _Supervisor:
             return
         error = _safe_message(message.get("message", "Native dbt session failed."))
         retirement_reason = validate_retirement_reason(message.get("retirement_reason"))
-        self._retire(error, retirement_reason=retirement_reason or "worker_failure")
+        error_code = "target_not_allowed" if message.get("code") == "target_not_allowed" else None
+        self._retire(
+            error,
+            retirement_reason=retirement_reason or "worker_failure",
+            error_code=error_code,
+        )
 
     def _read_child(self, now: float) -> None:
         assert self.child_socket is not None
@@ -897,7 +1040,7 @@ class _Supervisor:
         if self.state in {"starting", "active"}:
             self.child_output_count += len(data)
             if self.child_output_count > MAX_FRAME:
-                self._retire("dbt output exceeded the 16 MiB limit.")
+                self._retire("dbt output exceeded the 16 MiB limit.", cancel_active=True)
                 return False
         sample = (self.output_overlap + data).lower()
         self.output_overlap = sample[-256:]
@@ -913,6 +1056,18 @@ class _Supervisor:
                     {"type": "progress", "request_id": self.request_id, "status": "sso"},
                 )
         return True
+
+    def _request_cancel(self) -> None:
+        if self.child_socket is None or self.state != "active" or self.child_output:
+            # Never splice a control frame into a partly forwarded request.
+            return
+        self.cancellation = "requested_unverified"
+        try:
+            # This tiny frame is best-effort and nonblocking. The independent
+            # TERM/KILL deadline below never waits for adapter cancellation.
+            self.child_socket.send(encode({"type": "cancel"}))
+        except (BlockingIOError, OSError, WireError):
+            pass
 
     def _kill_child(self) -> None:
         child = self.child
@@ -952,11 +1107,16 @@ class _Supervisor:
         offender: _Client | None = None,
         stopped_by: _Client | None = None,
         retirement_reason: str = "worker_failure",
+        cancel_active: bool = False,
+        error_code: str | None = None,
     ) -> None:
         if self.state == "retiring":
             return
         retirement_reason = validate_retirement_reason(retirement_reason) or "worker_failure"
         was_starting = self.state == "starting"
+        was_active = self.state == "active"
+        if was_active and cancel_active:
+            self._request_cancel()
         self.state = "retiring"
         if (
             self.active is not None
@@ -971,6 +1131,8 @@ class _Supervisor:
                     "message": _safe_message(reason),
                     "sso": self.sso_sent,
                     "retirement_reason": retirement_reason,
+                    **({"code": error_code} if error_code == "target_not_allowed" else {}),
+                    **({"cancellation": self.cancellation} if self.cancellation else {}),
                 },
                 close=True,
             )
@@ -1008,7 +1170,7 @@ class _Supervisor:
         elif self.state == "ready" and now > self.idle_deadline:
             self._retire("Worker idle timeout expired.")
         elif self.state == "active" and now > self.request_deadline:
-            self._retire("dbt request timed out.", retirement_reason="timeout")
+            self._retire("dbt request timed out.", retirement_reason="timeout", cancel_active=True)
 
     def run(self) -> int:
         try:

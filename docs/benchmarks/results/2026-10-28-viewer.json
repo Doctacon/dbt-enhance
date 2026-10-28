@@ -1,0 +1,70 @@
+{
+  "python": "3.12.7",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "textual": "1.0.0",
+  "viewport": [
+    100,
+    30
+  ],
+  "theme": "dbt-enhance-dark",
+  "columns": 14,
+  "samples_per_workload": 3,
+  "workloads": {
+    "500": {
+      "seconds": [
+        {
+          "initial_render": 0.1958,
+          "sort_and_repaint": 0.0958,
+          "filter_and_repaint": 0.0924,
+          "find_and_repaint": 0.0233
+        },
+        {
+          "initial_render": 0.1863,
+          "sort_and_repaint": 0.0991,
+          "filter_and_repaint": 0.1046,
+          "find_and_repaint": 0.0235
+        },
+        {
+          "initial_render": 0.1778,
+          "sort_and_repaint": 0.096,
+          "filter_and_repaint": 0.1067,
+          "find_and_repaint": 0.0239
+        }
+      ],
+      "median_seconds": {
+        "initial_render": 0.1863,
+        "sort_and_repaint": 0.096,
+        "filter_and_repaint": 0.1046,
+        "find_and_repaint": 0.0235
+      }
+    },
+    "10000": {
+      "seconds": [
+        {
+          "initial_render": 1.319,
+          "sort_and_repaint": 1.2376,
+          "filter_and_repaint": 0.6939,
+          "find_and_repaint": 0.0491
+        },
+        {
+          "initial_render": 1.3692,
+          "sort_and_repaint": 1.2588,
+          "filter_and_repaint": 0.6679,
+          "find_and_repaint": 0.0477
+        },
+        {
+          "initial_render": 1.3638,
+          "sort_and_repaint": 1.2384,
+          "filter_and_repaint": 0.694,
+          "find_and_repaint": 0.0497
+        }
+      ],
+      "median_seconds": {
+        "initial_render": 1.3638,
+        "sort_and_repaint": 1.2384,
+        "filter_and_repaint": 0.6939,
+        "find_and_repaint": 0.0491
+      }
+    }
+  }
+}

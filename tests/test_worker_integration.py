@@ -60,6 +60,13 @@ select *, {{ answer() }} as answer from {{ ref('values') }} order by id
     assert information["versions"]["dbt_core"] == version("dbt-core")
     pid = information["session_pid"]
     assert first.rows == [[1, "alpha", None, True, 42], [2, "beta", 3, False, 42]]
+    assert first.column_types == ["number", "text", "number", "boolean", "number"]
+    assert first.target == "dev"
+    assert first.target_verified is True
+    assert first.backend == "worker"
+    assert first.adapter == "duckdb"
+    assert first.sql_provenance == "worker_native_result"
+    assert first.versions["dbt_core"] == version("dbt-core")
     assert "__dbt__cte__values" in first.compiled_sql
     assert "limit 500" in first.compiled_sql.lower()
 
@@ -97,6 +104,7 @@ select *, {{ answer() }} as answer from {{ ref('values') }} order by id
     assert math.isnan(numeric.rows[0][0])
     assert math.isinf(numeric.rows[0][1])
     assert numeric.rows[0][2:] == [12.5, "2025-01-02"]
+    assert numeric.column_types == ["number", "number", "number", "date"]
 
     capped = run_query(
         replace(request, sql="select range as id from range(10) limit 8; -- end", limit=2)
@@ -106,6 +114,18 @@ select *, {{ answer() }} as answer from {{ ref('values') }} order by id
     assert "limit 2" in capped.compiled_sql.lower()
     assert "dbt_enhance_preview" in capped.compiled_sql
     print(f"native worker cold={first.elapsed:.3f}s warm={second.elapsed:.3f}s")
+
+
+def test_native_target_policy_is_checked_and_changes_worker_generation(native_worker):
+    project, request = native_worker
+    unrestricted = run_query(request)
+    before = worker.status(project.resolve())["session_pid"]
+    restricted = run_query(replace(request, allowed_targets=("dev",)))
+    assert restricted.rows == unrestricted.rows
+    assert restricted.target_verified is True
+    assert worker.status(project.resolve())["session_pid"] != before
+    with pytest.raises(EnhanceError, match="not allowed"):
+        run_query(replace(request, allowed_targets=()))
 
 
 def test_real_worker_wide_previews_have_fresh_rows_and_sql(native_worker):

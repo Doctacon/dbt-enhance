@@ -34,6 +34,10 @@ class UnsupportedSession(RuntimeError):
     """Raised when native persistent sessions are unsafe in this interpreter."""
 
 
+class TargetNotAllowed(UnsupportedSession):
+    """Raised only when native configuration proves a denied target."""
+
+
 class SessionError(RuntimeError):
     """A scrubbed error with a content-free retirement diagnostic."""
 
@@ -115,6 +119,111 @@ def compatibility() -> dict[str, str]:
     return {"dbt_core": version, "python": platform.python_version()}
 
 
+def _package_versions(adapter_type: str) -> dict[str, str]:
+    """Return a deliberately small package-version allowlist."""
+
+    versions = compatibility()
+    distribution = {"duckdb": "dbt-duckdb", "snowflake": "dbt-snowflake"}.get(adapter_type)
+    if distribution is not None:
+        try:
+            versions[distribution.replace("-", "_")] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return versions
+
+
+def _validate_allowed_targets(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise ValueError("context.allowed_targets must be a list of strings or None")
+    return tuple(value)
+
+
+def _verify_target(target: str, allowed_targets: tuple[str, ...] | None) -> None:
+    if allowed_targets is not None and target not in allowed_targets:
+        raise TargetNotAllowed(
+            f"Native dbt target {target!r} is not allowed for this project. "
+            "No manifest was parsed and no query was executed."
+        )
+
+
+def resolve_configuration(context: dict[str, Any]) -> dict[str, Any]:
+    """Load native dbt configuration and stop before adapter or manifest setup."""
+
+    project_dir = context.get("project_dir")
+    profiles_dir = context.get("profiles_dir")
+    target = context.get("target")
+    if not isinstance(project_dir, str) or not os.path.isabs(project_dir):
+        raise ValueError("context.project_dir must be an absolute string")
+    if profiles_dir is not None and (
+        not isinstance(profiles_dir, str) or not os.path.isabs(profiles_dir)
+    ):
+        raise ValueError("context.profiles_dir must be an absolute string or None")
+    if target is not None and not isinstance(target, str):
+        raise ValueError("context.target must be a string or None")
+    allowed_targets = _validate_allowed_targets(context.get("allowed_targets"))
+    compatibility()
+
+    args = [
+        "show",
+        "--inline",
+        "select 1",
+        "--limit",
+        "1",
+        "--project-dir",
+        project_dir,
+        "--no-write-json",
+        "--no-send-anonymous-usage-stats",
+        "--no-upload-to-artifacts-ingest-api",
+        "--no-use-colors",
+        "--quiet",
+    ]
+    if profiles_dir is not None:
+        args.extend(("--profiles-dir", profiles_dir))
+    if target is not None:
+        args.extend(("--target", target))
+
+    flags_module = importlib.import_module("dbt.cli.flags")
+    requires = importlib.import_module("dbt.cli.requires")
+    ctx = flags_module.args_to_context(args)
+    ctx.obj = {"callbacks": []}
+    entered = False
+    try:
+        ctx.__enter__()
+        entered = True
+
+        @requires.profile
+        @requires.project
+        @requires.runtime_config
+        def load_config(click_context: Any) -> Any:
+            return click_context.obj["runtime_config"]
+
+        @requires.preflight
+        def bootstrap(click_context: Any) -> Any:
+            return load_config(click_context)
+
+        config = bootstrap(ctx)
+        actual_target = getattr(config, "target_name", None)
+        if not isinstance(actual_target, str) or not actual_target:
+            raise UnsupportedSession("Native dbt configuration did not prove a target name.")
+        _verify_target(actual_target, allowed_targets)
+        adapter_type = str(getattr(config.credentials, "type", "")).lower()
+        if adapter_type not in {"duckdb", "snowflake"}:
+            raise UnsupportedSession(
+                f"Persistent dbt sessions do not support adapter {adapter_type or '<unknown>'}. "
+                "Use the process backend instead."
+            )
+        return {
+            "target": actual_target,
+            "adapter": adapter_type,
+            "versions": _package_versions(adapter_type),
+        }
+    finally:
+        if entered:
+            ctx.__exit__(None, None, None)
+
+
 class _CappedTextBuffer(io.TextIOBase):
     def __init__(self, maximum: int) -> None:
         self.maximum = maximum
@@ -159,6 +268,7 @@ class DbtSession:
         self,
         context: dict[str, Any],
         on_config: Callable[[list[str]], None] | None = None,
+        on_context: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         project_dir = context.get("project_dir")
         profiles_dir = context.get("profiles_dir")
@@ -169,13 +279,18 @@ class DbtSession:
             raise ValueError("context.profiles_dir must be a string or None")
         if target is not None and not isinstance(target, str):
             raise ValueError("context.target must be a string or None")
+        allowed_targets = _validate_allowed_targets(context.get("allowed_targets"))
         if on_config is not None and not callable(on_config):
             raise TypeError("on_config must be callable or None")
+        if on_context is not None and not callable(on_context):
+            raise TypeError("on_context must be callable or None")
 
         self._project_dir = project_dir
         self._profiles_dir = profiles_dir
         self._target = target
+        self._allowed_targets = allowed_targets
         self._on_config = on_config
+        self._on_context = on_context
         self._initialized = False
         self._closed = False
         self._thread_id: int | None = None
@@ -185,8 +300,10 @@ class DbtSession:
         self._adapter: Any = None
         self._manifest: Any = None
         self._warnings: list[str] = []
+        self._rollback_failed = False
         self._event_callback: Callable[[Any], None] | None = None
         self._event_manager: Any = None
+        self._resolved_context: dict[str, Any] | None = None
 
     def _args(self, sql: str, limit: int) -> list[str]:
         args = [
@@ -211,6 +328,10 @@ class DbtSession:
 
     def _capture_event(self, event: Any) -> None:
         try:
+            if getattr(event.info, "name", None) == "RollbackFailed":
+                # Native adapters may suppress a rollback exception and clear
+                # their transaction flag before returning the original error.
+                self._rollback_failed = True
             if str(event.info.level).lower() != "warn":
                 return
             message = event.info.msg
@@ -301,6 +422,21 @@ class DbtSession:
             return load_config(context)
 
         self._config = bootstrap(ctx)
+        actual_target = getattr(self._config, "target_name", None)
+        if not isinstance(actual_target, str) or not actual_target:
+            raise UnsupportedSession("Native dbt configuration did not prove a target name.")
+        _verify_target(actual_target, self._allowed_targets)
+        adapter_type = str(getattr(self._config.credentials, "type", "")).lower()
+        versions = _package_versions(adapter_type)
+        self._resolved_context = {
+            "target": actual_target,
+            "target_verified": True,
+            "adapter": adapter_type,
+            "versions": versions,
+        }
+        if self._on_context is not None:
+            self._on_context(dict(self._resolved_context))
+
         flags = self._new_flags(sql, limit)
         bad_flags = self._unsupported_flags(flags)
         if bad_flags:
@@ -310,7 +446,6 @@ class DbtSession:
                 + ". Use the process backend instead."
             )
 
-        adapter_type = str(getattr(self._config.credentials, "type", "")).lower()
         if adapter_type not in {"duckdb", "snowflake"}:
             raise UnsupportedSession(
                 f"Persistent dbt sessions do not support adapter {adapter_type or '<unknown>'}. "
@@ -333,6 +468,12 @@ class DbtSession:
         if not self._initialized:
             self._initialize(sql, limit)
         else:
+            actual_target = getattr(self._config, "target_name", None)
+            if not isinstance(actual_target, str) or not actual_target:
+                raise UnsupportedSession("Native dbt configuration did not prove a target name.")
+            _verify_target(actual_target, self._allowed_targets)
+            if self._on_context is not None and self._resolved_context is not None:
+                self._on_context(dict(self._resolved_context))
             flags = self._new_flags(sql, limit)
             bad_flags = self._unsupported_flags(flags)
             if bad_flags:
@@ -353,6 +494,8 @@ class DbtSession:
     def _rollback_open_transaction(self) -> None:
         if self._adapter is None:
             return
+        if self._rollback_failed:
+            raise SessionError("Native dbt rollback failed; session cannot be retained")
         connection = self._adapter.connections.get_if_exists()
         state = importlib.import_module("dbt.adapters.contracts.connection").ConnectionState
         # Inspect state before handle: reading Connection.handle resolves an INIT
@@ -362,7 +505,18 @@ class DbtSession:
             and connection.state == state.OPEN
             and connection.transaction_open
         ):
-            self._adapter.connections.rollback_if_open()
+            # dbt's generic rollback catches driver failures and still clears
+            # transaction_open. That is not proof of cleanup. dbt-duckdb 1.9's
+            # connection wrapper also lacks rollback; its existing cursor owns
+            # the real driver connection. Use native rollback and propagate a
+            # failure so execute() retires rather than retaining unknown state.
+            handle = connection.handle
+            if self._config.credentials.type == "duckdb" and not callable(
+                getattr(handle, "rollback", None)
+            ):
+                handle = handle.cursor()
+            handle.rollback()
+            connection.transaction_open = False
 
     def _connection_is_open(self) -> bool:
         if self._adapter is None:
@@ -457,13 +611,24 @@ class DbtSession:
         return "driver_error_missing"
 
     @staticmethod
-    def _table_result(table: Any) -> tuple[list[str], list[list[Any]]]:
+    def _table_result(table: Any) -> tuple[list[str], list[list[Any]], list[str]]:
         columns = list(table.column_names)
+        kinds = {
+            "Text": "text",
+            "Boolean": "boolean",
+            "Number": "number",
+            "Integer": "number",
+            "Date": "date",
+            "DateTime": "datetime",
+            "ISODateTime": "datetime",
+            "TimeDelta": "time",
+        }
+        column_types = [kinds.get(type(kind).__name__, "unknown") for kind in table.column_types]
         output = _CappedTextBuffer(_MAX_JSON_BYTES)
         table.to_json(output)
         records = json.loads(output.getvalue())
         rows = [[record.get(column) for column in columns] for record in records]
-        return columns, rows
+        return columns, rows, column_types
 
     def execute(self, prepared_sql: str, limit: int) -> dict[str, Any]:
         if self._closed:
@@ -483,6 +648,7 @@ class DbtSession:
             raise SessionError("dbt session must be used from one OS thread")
 
         self._warnings = []
+        self._rollback_failed = False
         task: Any = None
         runner: Any = None
         completed = False
@@ -512,12 +678,15 @@ class DbtSession:
                         compiling = False
                         result = runner.execute(compiled, self._manifest)
 
-            columns, rows = self._table_result(result.agate_table)
+            columns, rows, column_types = self._table_result(result.agate_table)
             response = {
                 "columns": columns,
                 "rows": rows,
+                "column_types": column_types,
                 "compiled_sql": result.node.compiled_code,
                 "warnings": list(self._warnings),
+                **(self._resolved_context or {}),
+                "sql_provenance": "worker_native_result",
             }
             completed = True
             return response
@@ -577,6 +746,24 @@ class DbtSession:
                         message or _scrub_error(cleanup_error), reason="request_cleanup_failed"
                     ) from None
         raise QueryError(message) from None
+
+    def cancel_open_connections(self) -> str:
+        """Best-effort native cancellation callable from the control thread.
+
+        dbt's RunnableTask uses these same adapter methods.  A successful return
+        proves only that the adapter accepted the request, not that a warehouse
+        stopped work, so callers must retain the conservative certainty label.
+        """
+
+        adapter = self._adapter
+        if adapter is None:
+            return "requested_unverified"
+        try:
+            if adapter.is_cancelable():
+                adapter.cancel_open_connections()
+        except BaseException:
+            pass
+        return "requested_unverified"
 
     def _retire(self) -> None:
         try:

@@ -1,0 +1,48 @@
+{
+  "dbt_core": "1.12.6",
+  "dbt_duckdb": "1.9.6",
+  "python": "3.12.7",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "samples_per_workload": 3,
+  "workloads": {
+    "one_row": {
+      "process": {
+        "seconds": [
+          4.6232,
+          4.6341,
+          4.6026
+        ],
+        "median_seconds": 4.6232
+      },
+      "worker": {
+        "seconds": [
+          0.0322,
+          0.0289,
+          0.0288
+        ],
+        "median_seconds": 0.0289
+      }
+    },
+    "wide_10000": {
+      "process": {
+        "seconds": [
+          5.0826,
+          5.0758,
+          5.1783
+        ],
+        "median_seconds": 5.0826
+      },
+      "worker": {
+        "seconds": [
+          0.4318,
+          0.4014,
+          0.4403
+        ],
+        "median_seconds": 0.4318
+      }
+    }
+  },
+  "first_worker_seconds_with_warm_disk_cache": 2.2888,
+  "retained_connection_temporary_table": true,
+  "partial_parse_cache": true
+}
