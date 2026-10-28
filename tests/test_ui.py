@@ -443,25 +443,32 @@ async def test_late_worker_callbacks_cannot_replace_timeout(late_outcome: str) -
 
 @pytest.mark.asyncio
 async def test_sso_progress_adds_actionable_guidance_to_timeout() -> None:
-    request = QueryRequest("select 1", Path("model.sql"), timeout=0.05)
-    release = Event()
+    request = QueryRequest("select 1", Path("model.sql"), timeout=60)
+    now = 0.0
 
-    def awaiting_sso(_: QueryRequest, __: Event, on_status: object) -> QueryResult:
+    def awaiting_sso(_: QueryRequest, cancel: Event, on_status: object) -> QueryResult:
         on_status(SSO_STATUS)  # type: ignore[operator]
-        release.wait(2)
+        cancel.wait()
         return result()
 
-    app = QueryApp(request, runner=awaiting_sso)  # type: ignore[arg-type]
+    app = QueryApp(request, runner=awaiting_sso, clock=lambda: now)  # type: ignore[arg-type]
     async with app.run_test() as pilot:
-        try:
-            await pilot.pause(0.1)
-            message = app.query_one("#message").renderable.plain
-            assert "timed out" in message
-            assert "Run dbt debug in a terminal" in message
-            assert "approved credential caching" in message
-        finally:
-            release.set()
-            await pilot.pause(0.05)
+        for _ in range(100):
+            if str(app.query_one("#status").renderable) == SSO_STATUS:
+                break
+            await pilot.pause(0.01)
+        else:
+            pytest.fail("SSO progress was not displayed")
+
+        # Test timeout guidance after progress delivery, not scheduler speed.
+        # Separate watchdog tests exercise actual timer delivery.
+        now = request.timeout
+        app._show_timeout()
+        message = app.query_one("#message").renderable.plain
+        assert "timed out" in message
+        assert "Run dbt debug in a terminal" in message
+        assert "approved credential caching" in message
+        assert app._cancel_event.is_set()
 
 
 @pytest.mark.asyncio

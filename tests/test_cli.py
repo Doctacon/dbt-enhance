@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import tomlkit
+from click import unstyle
 from typer.testing import CliRunner
 
 from dbt_enhance import install
@@ -54,7 +55,11 @@ def test_config_validate_is_machine_readable_and_never_starts_dbt(tmp_path, monk
     assert payload["helix_bridge_format"] == 2
 
 
-def test_help_and_version():
+@pytest.mark.parametrize("force_color", [False, True])
+def test_help_and_version(monkeypatch, force_color):
+    if force_color:
+        # Exercise Rich's coloured output locally, not only on GitHub Actions.
+        monkeypatch.setenv("FORCE_COLOR", "1")
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     for name in ("query", "popup", "setup", "doctor", "demo"):
@@ -63,9 +68,12 @@ def test_help_and_version():
     assert "_helix" not in result.stdout
     setup_help = runner.invoke(app, ["setup", "--help"], terminal_width=140)
     assert setup_help.exit_code == 0
-    assert "--helix-shell-brid" in setup_help.stdout
-    assert "editor.shell" in setup_help.stdout
-    assert "owned fail-closed" in setup_help.stdout
+    # Rich can style the leading dashes separately from the option name.
+    # Check visible help text rather than ANSI-encoded presentation bytes.
+    setup_text = unstyle(setup_help.stdout)
+    assert "--helix-shell-brid" in setup_text
+    assert "editor.shell" in setup_text
+    assert "owned fail-closed" in setup_text
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "0.1.2" in result.stdout
